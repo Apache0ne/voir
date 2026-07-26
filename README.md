@@ -1,22 +1,29 @@
-# VOIR — Mage reservoir computing for albedo
+# VOIR — standalone Mage reservoir sampling for albedo
 
-VOIR freezes **Microsoft Mage-Flow-Edit-Turbo** as a high-dimensional nonlinear image reservoir, captures selected internal transformer states across a four-step flow trajectory, and trains only a compact dense readout. The first task is diffuse **albedo** prediction.
+VOIR freezes **Microsoft Mage-Flow-Edit-Turbo**, runs its edit trajectory with a standalone **Beta scheduler + DPM++ SDE device-noise sampler**, preserves selected internal transformer states, and trains only a compact albedo readout.
 
-## Current architecture
+**ComfyUI is not required or used by the pipeline.** The relevant scheduler, flow parameterization, Brownian noise, and DPM++ SDE equations are implemented directly in `voir/schedule.py` and `voir/sampling.py`.
+
+## Pipeline
 
 ```text
 RGB image + albedo instruction
           │
           ▼
-Frozen Mage VAE + text encoder + Mage-Flow-Edit-Turbo transformer
-          │
-          ├── beta-spaced flow state 1: selected hidden layers
-          ├── beta-spaced flow state 2: selected hidden layers
-          ├── beta-spaced flow state 3: selected hidden layers
-          └── beta-spaced flow state 4: selected hidden layers
+Frozen Mage VAE + text encoder + transformer
           │
           ▼
-Detached persistent ReservoirState [step, layer, channel, H, W]
+Beta schedule: 4 steps, alpha 0.60, beta 0.80
+          │
+          ▼
+DPM++ SDE, device-resident Brownian noise
+          │
+          ├── stage-1 transformer evaluation
+          ├── midpoint transformer evaluation
+          └── terminal denoised evaluation
+          │
+          ▼
+Detached states [model evaluation, layer, channel, H, W]
           │
           ▼
 Trainable AlbedoReadout only
@@ -25,30 +32,70 @@ Trainable AlbedoReadout only
 Diffuse RGB albedo
 ```
 
-The Mage backbone is set to `eval()`, every parameter has `requires_grad=False`, and captured features are detached before persistence. CPU and CUDA use the same state format and the same readout implementation.
+For four scheduled steps, DPM++ SDE performs **seven Mage transformer evaluations**. VOIR preserves all seven, rather than pretending the trajectory has only four internal states.
 
-## Requested sampling defaults
+## Exact sampling defaults
 
-- steps: `4`
-- beta scheduler alpha: `0.60`
-- beta scheduler beta: `0.80`
-- sigma rescale start: `1.00`
-- sigma rescale end: `0.00`
-- Comfy sampler preset: `dpmpp_sde_gpu`
+```text
+sampler       = dpmpp_sde_gpu
+steps         = 4
+beta alpha    = 0.60
+beta beta     = 0.80
+sigma start   = 1.00
+sigma end     = 0.00
+flow shift    = 6.00
+eta           = 1.00
+s_noise       = 1.00
+r             = 0.50
+```
 
-The ComfyUI nodes reproduce the native Comfy beta scheduler, the RES4LYF min/max rescale, and the requested KSampler selector. The standalone Mage capture path currently uses the model-correct rectified-flow Euler update with the same beta/rescaled trajectory. DPM++ SDE is exposed for Comfy-native model paths; it is not silently substituted into Mage's rectified-flow pipeline.
+The default standalone schedule is:
 
-## CPU proof
+```text
+[1.0000000, 0.9371303, 0.7925298, 0.4682927, 0.0000000]
+```
 
-The 4B Mage model is not intended for practical CPU inference. The repository includes a frozen nonlinear recurrent `ToyImageReservoir` so all reservoir/state/readout/training logic is testable on CPU:
+### How Beta is reproduced
+
+VOIR does not apply a continuous beta curve directly to four points. It reproduces the source ordering:
+
+1. Build the 1,000-entry discrete-flow sigma table with `shift*t / (1 + (shift-1)*t)`.
+2. Evaluate beta-distribution quantiles.
+3. Multiply by `999`, round to model-table indices, and remove consecutive duplicate indices.
+4. Select those exact model sigmas.
+5. Append terminal zero.
+6. Apply the requested min/max rescale from `1.0` to `0.0`.
+
+### How DPM++ SDE is adapted to Mage
+
+Mage predicts rectified-flow velocity. DPM++ expects a denoised estimate, so every model call is converted with the discrete-flow/CONST identity:
+
+```text
+x0 = x_sigma - sigma * velocity
+```
+
+The solver uses the CONST half-log-SNR mapping:
+
+```text
+lambda = log((1 - sigma) / sigma)
+sigma(lambda) = 1 / (1 + exp(lambda))
+```
+
+As in the source implementation, an initial sigma of exactly `1` is offset using `percent_to_sigma(1e-4)` before log-SNR evaluation. `dpmpp_sde_gpu` means the Brownian tree is generated on the latent device (`cpu=False`). The same function accepts CPU tensors for deterministic validation here and uses CUDA-resident noise when the latent is on CUDA.
+
+When `torchsde` is installed, VOIR uses its Brownian tree. A built-in path-consistent Brownian-bridge implementation is available as a dependency-free fallback; it is mathematically equivalent but not bitwise identical to the `torchsde` random stream.
+
+## CPU validation
+
+The complete scheduler, DPM++ SDE solver, Brownian process, state format, frozen toy reservoir, readout, and training path run on CPU:
 
 ```bash
 python -m pip install -e .[dev]
-python scripts/cpu_smoke.py
 pytest
+python scripts/cpu_sampler_smoke.py
 ```
 
-This writes `outputs/cpu_albedo_smoke.png` and verifies that only the readout receives gradients.
+The full 4B Mage checkpoint is not practical in this CPU environment. Actual Mage capture is the same code path on CUDA.
 
 ## Mage CUDA setup
 
@@ -58,63 +105,61 @@ python -m pip install -e ./Mage
 python -m pip install -e .[mage]
 ```
 
-Capture one state bundle:
+Capture one albedo reservoir state:
 
 ```bash
 voir capture-mage input.png states/input.pt \
   --preview-output outputs/mage_albedo_prompt.png \
   --device cuda --max-size 512 \
   --steps 4 --alpha 0.60 --beta 0.80 \
+  --sigma-start 1.0 --sigma-end 0.0 \
+  --eta 1.0 --s-noise 1.0 --r 0.5 \
   --layers 0,12,23 --projection-channels 64
 ```
 
-The default prompt is:
+The default instruction is:
 
 ```text
 remove illumination, shadows, highlights, and reflections; output diffuse albedo only
 ```
 
-Create a JSONL manifest with one cached state and exact/teacher albedo target per line:
+Each saved state records:
+
+- the five scheduled sigmas;
+- every actual model-evaluation sigma;
+- sampler name and DPM++ parameters;
+- Brownian backend;
+- selected transformer layers;
+- fixed projection width and seed.
+
+## Train only the readout
+
+Manifest line:
 
 ```json
 {"state":"states/a.pt","albedo":"targets/a.png"}
 ```
 
-Train only the readout:
+Training:
 
 ```bash
 voir train-albedo dataset.jsonl checkpoints/albedo_v1.pt \
   --device cuda --epochs 20 --batch-size 2
 ```
 
-Inference from a cached state can run on CPU or CUDA:
+Inference from cached states works on CPU or CUDA:
 
 ```bash
 voir predict-albedo states/input.pt checkpoints/albedo_v1.pt outputs/albedo.png --device cpu
 ```
 
-## ComfyUI installation
+## Albedo data order
 
-Clone this repository into `ComfyUI/custom_nodes/voir`, install the package in the Comfy Python environment, and restart ComfyUI.
+Start with exact synthetic base-color supervision, then add lower-weight real-image pseudo-labels:
 
-Nodes:
+1. Rendered objects with known base color and randomized HDRI, key/fill lighting, exposure, roughness, metallic response, and backgrounds.
+2. Human, clothing, and armor renders with exact material IDs and diffuse maps.
+3. Real photographs labeled by an intrinsic-image or PBR teacher.
+4. Hard cases: colored illumination, cast shadows, glossy armor, skin subsurface scattering, reflections, and textured cloth.
 
-- **VOIR Beta Sampling Scheduler** — defaults to 4 / 0.60 / 0.80.
-- **VOIR Sigmas Rescale** — defaults to 1.00 → 0.00.
-- **VOIR KSampler Select** — defaults to `dpmpp_sde_gpu`.
-- **VOIR Mage Turbo Sampling Preset** — combines all three settings.
-- **VOIR Mage Flow Edit Turbo Loader**.
-- **VOIR Mage Capture Albedo States**.
-- **VOIR Albedo Readout Loader**.
-- **VOIR Albedo Readout Apply**.
-
-## Dataset direction for albedo v1
-
-Use exact synthetic supervision first, then mix real-image pseudo-labels:
-
-1. Rendered objects with known base-color/albedo, randomized HDRI, key/fill lights, exposure, roughness, metallic and background.
-2. Human/clothing/armor renders with exact material IDs and diffuse maps.
-3. Real photographs labeled by a strong intrinsic-image or PBR teacher, with lower loss weight.
-4. Hard examples: colored illumination, cast shadows, specular highlights, glossy armor, skin subsurface scattering and textured cloth.
-
-Do not train Mage in stage 1. Establish linear/small-decoder probe quality first; optional LoRA belongs in a later ablation.
+Mage remains frozen in stage 1. Only the readout is optimized.
