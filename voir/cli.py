@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(prog="voir")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    cap = sub.add_parser("capture-mage", help="capture frozen Mage edit states")
+    cap = sub.add_parser("capture-mage", help="capture frozen Mage states with native Beta + DPM++ SDE")
     cap.add_argument("image")
     cap.add_argument("state_output")
     cap.add_argument("--preview-output")
@@ -33,6 +33,14 @@ def main():
     cap.add_argument("--steps", type=int, default=4)
     cap.add_argument("--alpha", type=float, default=0.60)
     cap.add_argument("--beta", type=float, default=0.80)
+    cap.add_argument("--sigma-start", type=float, default=1.0)
+    cap.add_argument("--sigma-end", type=float, default=0.0)
+    cap.add_argument("--shift", type=float, default=6.0)
+    cap.add_argument("--train-timesteps", type=int, default=1000)
+    cap.add_argument("--eta", type=float, default=1.0)
+    cap.add_argument("--s-noise", type=float, default=1.0)
+    cap.add_argument("--r", type=float, default=0.5)
+    cap.add_argument("--native-brownian", action="store_true", help="use the built-in Brownian bridge instead of torchsde")
     cap.add_argument("--layers", type=_layers, default=(0, 12, 23))
     cap.add_argument("--projection-channels", type=int, default=64)
 
@@ -60,6 +68,14 @@ def main():
             steps=args.steps,
             alpha=args.alpha,
             beta=args.beta,
+            start=args.sigma_start,
+            end=args.sigma_end,
+            shift=args.shift,
+            train_timesteps=args.train_timesteps,
+            eta=args.eta,
+            s_noise=args.s_noise,
+            r=args.r,
+            prefer_torchsde=not args.native_brownian,
         )
         reservoir = MageEditReservoir.from_pretrained(args.model, args.device, config)
         state, preview = reservoir.capture(args.image, args.prompt, args.seed, args.max_size)
@@ -70,6 +86,10 @@ def main():
             "state": args.state_output,
             "shape": list(state.features.shape),
             "readout_channels": state.readout_channels,
+            "sampler": state.metadata.get("sampler"),
+            "schedule_sigmas": state.metadata.get("schedule_sigmas"),
+            "model_evaluations": len(state.metadata.get("model_eval_sigmas", [])),
+            "noise_backend": state.metadata.get("noise_backend"),
         }))
     elif args.command == "train-albedo":
         result = train_albedo(
