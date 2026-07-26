@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+from .mage_sampler import MageDPMppSDEEditSampler, MageSamplerConfig
 from .projection import feature_hash_project
-from .schedule import beta_flow_sigmas
 from .state import ReservoirState
 
 
@@ -23,6 +23,11 @@ class CaptureConfig:
     start: float = 1.0
     end: float = 0.0
     shift: float = 6.0
+    train_timesteps: int = 1000
+    eta: float = 1.0
+    s_noise: float = 1.0
+    r: float = 0.5
+    prefer_torchsde: bool = True
 
 
 def _infer_grid(token_count: int, height: int, width: int) -> tuple[int, int]:
@@ -50,10 +55,20 @@ class _HiddenCollector:
         self.handles: list[torch.utils.hooks.RemovableHandle] = []
         self.layers = config.layers
         self.by_layer: dict[int, list[torch.Tensor]] = {i: [] for i in self.layers}
+        self.eval_sigmas: list[float] = []
+        self.current_sigma: float | None = None
+        self.current_eval_index: int | None = None
+
+    def begin_eval(self, sigma: float, eval_index: int) -> None:
+        self.current_sigma = float(sigma)
+        self.current_eval_index = int(eval_index)
+        self.eval_sigmas.append(float(sigma))
 
     def _hook(self, layer_idx: int):
         def collect(_module, _inputs, output):
             image_tokens = output[1] if isinstance(output, (tuple, list)) else output
+            if self.current_sigma is None:
+                raise RuntimeError("hidden-state hook fired outside a sampler model evaluation")
             target_tokens = image_tokens.shape[1] // (self.num_refs + 1)
             x = image_tokens[:, :target_tokens].detach()
             x = feature_hash_project(x, self.config.projection_channels, self.config.projection_seed + layer_idx)
@@ -82,44 +97,21 @@ class _HiddenCollector:
             handle.remove()
         self.handles.clear()
 
-    def stack(self) -> torch.Tensor:
+    def stack(self) -> tuple[torch.Tensor, torch.Tensor]:
         counts = {idx: len(items) for idx, items in self.by_layer.items()}
         if not counts or min(counts.values(), default=0) == 0:
             raise RuntimeError("no Mage hidden states were captured")
-        steps = min(counts.values())
-        layer_tensors = [torch.cat(self.by_layer[idx][:steps], dim=0) for idx in self.layers]
-        return torch.stack(layer_tensors, dim=1)
-
-
-class _BetaFlowScheduler:
-    """FlowMatchEuler scheduler whose timesteps are fixed to the VOIR beta schedule."""
-
-    def __init__(self, sigmas: torch.Tensor):
-        try:
-            from diffusers import FlowMatchEulerDiscreteScheduler
-        except ImportError as exc:
-            raise RuntimeError("Install VOIR with the 'mage' extra to capture Mage states") from exc
-        self._scheduler = FlowMatchEulerDiscreteScheduler(
-            num_train_timesteps=1000, shift=1.0, use_dynamic_shifting=False
-        )
-        self._voir_sigmas = sigmas.detach().cpu().float()
-        self.timesteps = None
-        self.sigmas = None
-
-    def set_shift(self, _shift: float) -> None:
-        return None
-
-    def set_timesteps(self, *args, device=None, **kwargs) -> None:
-        self._scheduler.set_timesteps(sigmas=self._voir_sigmas[:-1].tolist(), device=device)
-        self.timesteps = self._scheduler.timesteps
-        self.sigmas = self._scheduler.sigmas
-
-    def step(self, *args, **kwargs):
-        return self._scheduler.step(*args, **kwargs)
+        evaluations = min(min(counts.values()), len(self.eval_sigmas))
+        if evaluations == 0:
+            raise RuntimeError("no sampler evaluation sigmas were captured")
+        layer_tensors = [torch.cat(self.by_layer[idx][:evaluations], dim=0) for idx in self.layers]
+        features = torch.stack(layer_tensors, dim=1)
+        sigmas = torch.tensor(self.eval_sigmas[:evaluations], dtype=torch.float32)
+        return features, sigmas
 
 
 class MageEditReservoir:
-    """Frozen Mage-Flow-Edit-Turbo state extractor."""
+    """Frozen Mage-Flow-Edit-Turbo state extractor using native Beta + DPM++ SDE."""
 
     def __init__(self, pipeline, config: CaptureConfig | None = None):
         self.pipeline = pipeline
@@ -157,35 +149,59 @@ class MageEditReservoir:
         scale = min(1.0, max_size / max(w, h)) if max_size else 1.0
         out_h = max(16, int(h * scale) // 16 * 16)
         out_w = max(16, int(w * scale) // 16 * 16)
-        sigmas = beta_flow_sigmas(
-            self.config.steps, self.config.alpha, self.config.beta,
-            self.config.start, self.config.end, self.config.shift,
+
+        sampler_config = MageSamplerConfig(
+            steps=self.config.steps,
+            alpha=self.config.alpha,
+            beta=self.config.beta,
+            start=self.config.start,
+            end=self.config.end,
+            shift=self.config.shift,
+            train_timesteps=self.config.train_timesteps,
+            eta=self.config.eta,
+            s_noise=self.config.s_noise,
+            r=self.config.r,
+            prefer_torchsde=self.config.prefer_torchsde,
         )
-        model = self.pipeline.model
-        prior_scheduler = getattr(model, "scheduler", None)
-        model.scheduler = _BetaFlowScheduler(sigmas)
-        try:
-            with _HiddenCollector(model.transformer, self.config, (out_h, out_w), num_refs=1) as collector:
-                edited = self.pipeline.edit(
-                    [prompt], [[image]], seeds=[int(seed)], steps=self.config.steps,
-                    cfg=1.0, heights=[out_h], widths=[out_w],
-                )[0]
-            features = collector.stack()
-            captured_layers = collector.layers
-        finally:
-            model.scheduler = prior_scheduler
+        sampler = MageDPMppSDEEditSampler(self.pipeline, sampler_config)
+        with _HiddenCollector(
+            self.pipeline.model.transformer,
+            self.config,
+            (out_h, out_w),
+            num_refs=1,
+        ) as collector:
+            edited, trace, _ = sampler.edit(
+                image,
+                prompt,
+                seed=int(seed),
+                max_size=None,
+                height=out_h,
+                width=out_w,
+                on_model_eval=collector.begin_eval,
+            )
+        features, eval_sigmas = collector.stack()
         state = ReservoirState(
             features=features,
             output_size=(out_h, out_w),
-            sigmas=sigmas,
-            layer_indices=captured_layers,
+            sigmas=eval_sigmas,
+            layer_indices=collector.layers,
             source="microsoft/Mage-Flow-Edit-Turbo",
             metadata={
                 "prompt": prompt,
                 "seed": int(seed),
                 "projection_channels": self.config.projection_channels,
-                "sampler": "flow_euler_beta",
-                "requested_comfy_sampler": "dpmpp_sde_gpu",
+                "sampler": trace.sampler,
+                "schedule_sigmas": trace.schedule_sigmas.tolist(),
+                "model_eval_sigmas": trace.model_eval_sigmas.tolist(),
+                "noise_backend": trace.noise_backend,
+                "eta": trace.eta,
+                "s_noise": trace.s_noise,
+                "r": trace.r,
+                "beta_alpha": self.config.alpha,
+                "beta_beta": self.config.beta,
+                "sigma_start": self.config.start,
+                "sigma_end": self.config.end,
+                "shift": self.config.shift,
             },
         ).validate()
         return state, edited
@@ -218,12 +234,12 @@ class ToyImageReservoir(nn.Module):
         for _ in range(self.steps):
             state = torch.tanh(base + 0.75 * self.recurrent_conv(state))
             states.append(state.detach().cpu())
-        features = torch.stack(states, dim=0).unsqueeze(1)
+        features = torch.stack(states, dim=0).unsqueeze(1)[:, :, 0]
         h, w = image.shape[-2:]
         return ReservoirState(
-            features=features[:, :, 0],
+            features=features,
             output_size=(h, w),
-            sigmas=torch.linspace(1, 0, self.steps + 1),
+            sigmas=torch.linspace(1, 0, self.steps),
             layer_indices=(0,),
             source="voir/ToyImageReservoir",
         ).validate()
