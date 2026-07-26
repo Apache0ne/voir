@@ -12,3 +12,4 @@ jobs:
           python-version: "3.11"
       - run: pip install .[dev]
       - run: pytest
+      - run: python scripts/cpu_sampler_smoke.py
