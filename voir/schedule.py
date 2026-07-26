@@ -46,6 +46,5 @@ def beta_flow_sigmas(
 ) -> torch.Tensor:
     """Beta-spaced Mage flow schedule with RES4LYF-style endpoint rescaling."""
     q = static_shift(beta_quantiles(steps, alpha, beta), shift=shift)
-    q = rescale_sigmas(q, start=start, end=end)
-    terminal = q.new_tensor([float(end)])
-    return torch.cat([q, terminal]).to(device)
+    q = torch.cat([q, q.new_zeros(1)])
+    return rescale_sigmas(q, start=start, end=end).to(device)
