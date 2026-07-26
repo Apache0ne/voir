@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voir-mage-reservoir"
-version = "0.1.0"
-description = "Frozen Mage-Flow-Edit-Turbo reservoir state capture and trainable albedo readout"
+version = "0.2.0"
+description = "Standalone Beta plus DPM++ SDE sampling for frozen Mage reservoir states and albedo readouts"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -25,6 +25,7 @@ mage = [
   "loguru>=0.7",
   "pydantic>=2.0",
   "safetensors>=0.4",
+  "torchsde>=0.2.6",
   "torchvision>=0.19",
   "transformers>=4.55",
 ]
@@ -34,7 +35,7 @@ dev = ["pytest>=8.0"]
 voir = "voir.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["voir*", "comfyui_nodes*"]
+include = ["voir*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
