@@ -23,8 +23,8 @@ class ReservoirState:
             raise ValueError(f"features must be [T,L,C,H,W], got {tuple(self.features.shape)}")
         if self.sigmas.ndim != 1:
             raise ValueError("sigmas must be one-dimensional")
-        if self.features.shape[0] > self.sigmas.numel():
-            raise ValueError("not enough sigma values for captured trajectory")
+        if self.features.shape[0] != self.sigmas.numel():
+            raise ValueError("one model-evaluation sigma is required for every captured state")
         if self.features.shape[1] != len(self.layer_indices):
             raise ValueError("layer_indices does not match feature layer axis")
         return self
