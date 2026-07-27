@@ -13,3 +13,4 @@ jobs:
       - run: pip install .[dev]
       - run: pytest
       - run: python scripts/cpu_sampler_smoke.py
+      - run: python scripts/cpu_albedo_benchmark.py --quick
