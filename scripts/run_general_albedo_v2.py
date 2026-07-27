@@ -98,6 +98,67 @@ def _source_baseline(cache_dir: Path) -> dict[str, float]:
     return {name: value / max(count, 1) for name, value in totals.items()}
 
 
+def _write_general_model_card(
+    model_dir: Path,
+    *,
+    cache_name: str,
+    model_repo: str,
+    total: int,
+    domains: dict[str, int],
+    summary: dict[str, Any],
+    acceptance: dict[str, Any],
+) -> None:
+    card = f"""---
+license: cc-by-nc-4.0
+pipeline_tag: image-to-image
+tags:
+- albedo
+- inverse-rendering
+- mage-flow
+- reservoir-computing
+- intrinsic-images
+- pytorch
+---
+
+# VOIR General Albedo v2
+
+Full-resolution albedo decoder trained on cached internal trajectories from the
+frozen `microsoft/Mage-Flow-Edit-Turbo` model.
+
+## Training data
+
+- Cache: `{cache_name}`
+- Total paired Mage caches: {total}
+- Olbedo real outdoor/aerial pairs: {domains['olbedo']}
+- MatPredict rendered-object pairs: {domains['matpredict']}
+- PBR-Rooms rendered-indoor pairs: {domains['pbrrooms']}
+- Train images: {summary['train_images']}
+- Validation images: {summary['validation_images']}
+
+The PBR-Rooms component is CC BY-NC 4.0, so this mixed-data checkpoint is marked
+non-commercial. Remove that source and retrain for a differently licensed model.
+
+## Held-out validation
+
+```json
+{json.dumps(summary['final_validation'], indent=2)}
+```
+
+## Source-RGB baseline and acceptance
+
+```json
+{json.dumps(acceptance, indent=2)}
+```
+
+This is a multi-domain research checkpoint, not a guarantee of exact albedo for
+all possible images. Single-image intrinsic decomposition is underdetermined, and
+performance must be evaluated on each intended deployment domain.
+
+Model repository: `{model_repo}`
+"""
+    (model_dir / "README.md").write_text(card, encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the resumable VOIR general albedo v2 pipeline.")
     parser.add_argument("--repo-dir", default="/content/voir-general")
@@ -130,6 +191,7 @@ def main() -> None:
     pairs_dir = work_dir / "pairs"
     cache_dir = work_dir / "cache"
     model_dir = work_dir / "model"
+    training_dataset_dir = work_dir / "training_dataset"
     mirror_pairs = mirror_dir / "pairs"
     mirror_cache = mirror_dir / "cache"
     mirror_model = mirror_dir / "model"
@@ -157,7 +219,6 @@ def main() -> None:
     environment["HF_TOKEN"] = token
     environment["HUGGING_FACE_HUB_TOKEN"] = token
 
-    # Build or reuse the multi-domain paired dataset.
     _run(
         [
             sys.executable,
@@ -185,8 +246,6 @@ def main() -> None:
         raise RuntimeError(f"paired dataset has {len(pair_rows)} rows; expected {total}")
     _mirror_tree(pairs_dir, mirror_pairs)
 
-    # Capture in chunks. Each chunk is independently complete and then mirrored,
-    # so a Colab disconnect only loses the current chunk.
     chunk = max(1, int(args.chunk_size))
     for end in range(chunk, total + chunk, chunk):
         end = min(end, total)
@@ -233,6 +292,7 @@ def main() -> None:
     _validate_cache_count(cache_dir, total)
     _mirror_tree(cache_dir, mirror_cache)
 
+    cache_name = args.cache_repo or "local/voir-general-albedo-v2-cache"
     if args.cache_repo and not args.skip_cache_upload:
         from huggingface_hub import HfApi
 
@@ -252,6 +312,14 @@ def main() -> None:
         print(json.dumps({"status": "CACHE_COMPLETE", "pairs": total, "cache_dir": str(cache_dir)}, indent=2))
         return
 
+    # The legacy trainer checks for dataset_dir/mage_cache/real16 before resolving
+    # a local cache root. Create a lightweight symlink instead of copying the cache.
+    if training_dataset_dir.exists() or training_dataset_dir.is_symlink():
+        shutil.rmtree(training_dataset_dir, ignore_errors=True)
+    nested = training_dataset_dir / "mage_cache"
+    nested.mkdir(parents=True, exist_ok=True)
+    os.symlink(cache_dir, nested / "real16", target_is_directory=True)
+
     if model_dir.exists():
         shutil.rmtree(model_dir)
     model_dir.mkdir(parents=True)
@@ -259,8 +327,10 @@ def main() -> None:
         [
             sys.executable,
             repo_dir / "scripts/train_hf_real_mage.py",
+            "--hf-dataset",
+            cache_name,
             "--dataset-dir",
-            cache_dir,
+            training_dataset_dir,
             "--output-dir",
             model_dir,
             "--epochs",
@@ -289,13 +359,10 @@ def main() -> None:
             "20260727",
             "--num-workers",
             "0",
-            "--upload-repo",
-            args.model_repo,
         ],
         cwd=repo_dir,
         env=environment,
     )
-    _mirror_tree(model_dir, mirror_model)
 
     summary_path = model_dir / "summary.json"
     if not summary_path.exists():
@@ -310,14 +377,15 @@ def main() -> None:
         "ssim_above_0_75": model_metrics["ssim_7x7"] > 0.75,
         "beats_source_mae_by_10_percent": relative_mae_gain >= 0.10,
     }
+    domains = {
+        "olbedo": args.olbedo_count,
+        "matpredict": args.matpredict_count,
+        "pbrrooms": args.pbrrooms_count,
+    }
     final = {
         "status": "PASS" if all(gate.values()) else "TRAINED_NEEDS_MORE_DATA",
         "pairs": total,
-        "domains": {
-            "olbedo": args.olbedo_count,
-            "matpredict": args.matpredict_count,
-            "pbrrooms": args.pbrrooms_count,
-        },
+        "domains": domains,
         "model_repo": args.model_repo,
         "source_rgb_baseline": source_baseline,
         "model_validation": model_metrics,
@@ -328,7 +396,30 @@ def main() -> None:
         "completed_unix": time.time(),
     }
     (model_dir / "general_v2_acceptance.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
+    _write_general_model_card(
+        model_dir,
+        cache_name=cache_name,
+        model_repo=args.model_repo,
+        total=total,
+        domains=domains,
+        summary=summary,
+        acceptance=final,
+    )
     _mirror_tree(model_dir, mirror_model)
+
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    api.create_repo(args.model_repo, repo_type="model", private=False, exist_ok=True)
+    commit = api.upload_folder(
+        repo_id=args.model_repo,
+        repo_type="model",
+        folder_path=model_dir,
+        commit_message="Train multi-domain actual-Mage general albedo v2",
+    )
+    print("HF_MODEL_REPO=", args.model_repo)
+    print("HF_MODEL_COMMIT=", commit.oid)
+    print("HF_MODEL_URL=https://huggingface.co/" + args.model_repo)
     print(json.dumps(final, indent=2))
 
 
