@@ -1,9 +1,13 @@
 """Cache actual Mage-Flow-Edit-Turbo trajectories for sixteen paired real images.
 
-The output is intentionally GitHub-friendly: one portable float16 ``.pt`` file
-per image, plus PNG inputs/targets/masks/previews and JSON manifests. No raw
+The output is intentionally GitHub-friendly: one portable mixed-precision ``.pt``
+file per image, plus PNG inputs/targets/masks/previews and JSON manifests. No raw
 full-width transformer activations are stored; selected layers are reduced by the
 fixed deterministic hash projection configured in ``CaptureConfig``.
+
+Projected transformer states stay float32 because their valid dynamic range can
+exceed float16 even when every source value is finite. Large sampler/conditioning
+tensors remain float16.
 """
 from __future__ import annotations
 
@@ -74,13 +78,23 @@ def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _state_payload(state: ReservoirState) -> dict[str, Any]:
     state.validate()
+    # Do not downcast projected hidden states to float16. The fixed hash projection
+    # can produce finite values outside float16's +/-65504 range. A float16 cast
+    # would silently create infinities and corrupt an otherwise valid capture.
+    features = state.features.detach().cpu().float().contiguous()
+    if not torch.isfinite(features).all():
+        raise ValueError("projected hidden states are non-finite before serialization")
     return {
-        "features": state.features.detach().cpu().to(torch.float16).contiguous(),
+        "features": features,
         "output_size": tuple(int(value) for value in state.output_size),
         "sigmas": state.sigmas.detach().cpu().float().contiguous(),
         "layer_indices": tuple(int(value) for value in state.layer_indices),
         "source": state.source,
-        "metadata": state.metadata,
+        "metadata": {
+            **state.metadata,
+            "feature_storage_dtype": "float32",
+            "feature_max_abs": float(features.abs().max()),
+        },
         "aux_features": None
         if state.aux_features is None
         else state.aux_features.detach().cpu().to(torch.float16).contiguous(),
@@ -131,7 +145,7 @@ def main() -> None:
     parser.add_argument("--model", default="microsoft/Mage-Flow-Edit-Turbo")
     parser.add_argument("--count", type=int, default=16)
     parser.add_argument("--max-size", type=int, default=512)
-    parser.add_argument("--layers", default="0,5,11,17,23")
+    parser.add_argument("--layers", default="0,2,5,8,11")
     parser.add_argument("--projection-channels", type=int, default=64)
     parser.add_argument("--projection-seed", type=int, default=1337)
     parser.add_argument("--seed-base", type=int, default=42000)
@@ -185,10 +199,12 @@ def main() -> None:
 
     started = time.time()
     print(f"Loading {args.model} on CUDA...")
-    reservoir = MageEditReservoir.from_pretrained(args.model, device="cuda", config=config)
-    # Mage's checkpoint config currently defaults to flash2. Override it after
-    # construction as well; backend resolution is lazy, so this takes effect
-    # before the first transformer/text-encoder attention call.
+    reservoir = MageEditReservoir.from_pretrained(
+        args.model,
+        device="cuda",
+        config=config,
+        attn_backend=args.attn_backend,
+    )
     set_attn_backend(args.attn_backend)
     reservoir.pipeline.model.eval().requires_grad_(False)
     if any(parameter.requires_grad for parameter in reservoir.pipeline.model.parameters()):
@@ -207,6 +223,7 @@ def main() -> None:
         "projection_seed": args.projection_seed,
         "seed_base": args.seed_base,
         "attention_backend": args.attn_backend,
+        "feature_storage_dtype": "float32",
         "sampler": {
             "name": "dpmpp_sde_gpu",
             "steps": 4,
@@ -271,6 +288,7 @@ def main() -> None:
         )
         preview.save(preview_path, optimize=True)
 
+        feature_max_abs = float(state.features.abs().max())
         row = {
             "index": index,
             "source_row": record.get("source_row"),
@@ -284,6 +302,8 @@ def main() -> None:
             "preview": str(preview_path.relative_to(output_dir)),
             "cache": str(state_path.relative_to(output_dir)),
             "state_shape": list(state.features.shape),
+            "state_dtype": "float32",
+            "state_max_abs": feature_max_abs,
             "auxiliary_shape": None if state.aux_features is None else list(state.aux_features.shape),
             "output_size": list(state.output_size),
             "target_grid": list(sampler_cache.target_grid),
@@ -319,16 +339,9 @@ def main() -> None:
                 f"{stem}.pt is {row['cache_bytes'] / 2**20:.1f} MiB, above the configured "
                 f"GitHub-safe limit of {args.max_file_mib:.1f} MiB"
             )
+
         # Reload from disk so a successful row proves the serialized cache itself is valid.
-        disk_payload = _validate_cache(state_path)
-        disk_payload["manifest_record"].update(
-            {"cache_bytes": row["cache_bytes"], "cache_sha256": row["cache_sha256"]}
-        )
-        payload["manifest_record"] = row
-        torch.save(payload, temporary)
-        temporary.replace(state_path)
-        row["cache_bytes"] = int(state_path.stat().st_size)
-        row["cache_sha256"] = _sha256(state_path)
+        _validate_cache(state_path)
 
         completed_rows.append(row)
         run_info["items"] = completed_rows
@@ -336,9 +349,10 @@ def main() -> None:
         _atomic_json(output_dir / "run.json", run_info)
         print(
             f"    saved {state_path.name}: {row['cache_bytes'] / 2**20:.2f} MiB, "
-            f"state={row['state_shape']}, evals={row['model_evaluations']}"
+            f"state={row['state_shape']}, max_abs={feature_max_abs:.3f}, "
+            f"evals={row['model_evaluations']}"
         )
-        del state, sampler_cache, payload, disk_payload
+        del state, sampler_cache, payload
         torch.cuda.empty_cache()
 
     run_info["status"] = "complete"
