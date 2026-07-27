@@ -51,7 +51,7 @@ class ReservoirState:
         return self.trajectory_channels + self.auxiliary_channels
 
     def flattened(self, device: str | torch.device | None = None) -> torch.Tensor:
-        """Return [1,C,H,W] with fixed source features first, then trajectory states."""
+        """Return [1,C,H,W] with trajectory states first, then fixed auxiliary features."""
         self.validate()
         t, l, c, h, w = self.features.shape
         trajectory = self.features.reshape(1, t * l * c, h, w)
@@ -61,7 +61,7 @@ class ReservoirState:
             aux = self.aux_features.unsqueeze(0)
             if tuple(aux.shape[-2:]) != (h, w):
                 aux = F.interpolate(aux.float(), size=(h, w), mode="bilinear", align_corners=False)
-            x = torch.cat([aux.to(dtype=trajectory.dtype), trajectory], dim=1)
+            x = torch.cat([trajectory, aux.to(dtype=trajectory.dtype)], dim=1)
         return x.to(device) if device is not None else x
 
     def save(self, path: str | Path) -> None:
