@@ -29,7 +29,7 @@ def test_cpu_reservoir_is_frozen_and_readout_shapes_match():
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_state_round_trip_preserves_auxiliary_first_order(tmp_path):
+def test_state_round_trip_preserves_trajectory_first_order(tmp_path):
     state = ReservoirState(
         features=torch.zeros(4, 3, 8, 6, 5),
         output_size=(96, 80),
@@ -42,11 +42,12 @@ def test_state_round_trip_preserves_auxiliary_first_order(tmp_path):
     state.save(path)
     loaded = ReservoirState.load(path)
     flat = loaded.flattened()
+    trajectory_channels = 4 * 3 * 8
     assert torch.equal(loaded.features, state.features)
     assert torch.equal(loaded.aux_features, state.aux_features)
-    assert loaded.readout_channels == 7 + 4 * 3 * 8
-    assert torch.equal(flat[:, :7], torch.ones(1, 7, 6, 5))
-    assert torch.equal(flat[:, 7:], torch.zeros(1, 4 * 3 * 8, 6, 5))
+    assert loaded.readout_channels == 7 + trajectory_channels
+    assert torch.equal(flat[:, :trajectory_channels], torch.zeros(1, trajectory_channels, 6, 5))
+    assert torch.equal(flat[:, trajectory_channels:], torch.ones(1, 7, 6, 5))
 
 
 def test_v2_and_legacy_checkpoint_round_trip():
