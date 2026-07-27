@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voir-mage-reservoir"
-version = "0.2.0"
-description = "Standalone Beta plus DPM++ SDE sampling for frozen Mage reservoir states and albedo readouts"
+version = "0.3.0"
+description = "Standalone Beta plus DPM++ SDE sampling, frozen Mage reservoir states, and an intrinsic-albedo v2 readout"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
