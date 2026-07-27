@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
 
+from .albedo_features import fixed_albedo_features
 from .mage_sampler import MageDPMppSDEEditSampler, MageSamplerConfig
 from .projection import feature_hash_project
 from .state import ReservoirState
@@ -180,12 +182,18 @@ class MageEditReservoir:
                 on_model_eval=collector.begin_eval,
             )
         features, eval_sigmas = collector.stack()
+
+        resized = image.resize((out_w, out_h), Image.Resampling.BICUBIC)
+        source = torch.from_numpy(np.asarray(resized, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        aux_features = fixed_albedo_features(source, size=tuple(features.shape[-2:])).cpu()
+
         state = ReservoirState(
             features=features,
             output_size=(out_h, out_w),
             sigmas=eval_sigmas,
             layer_indices=collector.layers,
             source="microsoft/Mage-Flow-Edit-Turbo",
+            aux_features=aux_features,
             metadata={
                 "prompt": prompt,
                 "seed": int(seed),
@@ -202,6 +210,8 @@ class MageEditReservoir:
                 "sigma_start": self.config.start,
                 "sigma_end": self.config.end,
                 "shift": self.config.shift,
+                "trajectory_channels": int(features.shape[0] * features.shape[1] * features.shape[2]),
+                "auxiliary_channels": int(aux_features.shape[0]),
             },
         ).validate()
         return state, edited
@@ -218,6 +228,8 @@ class ToyImageReservoir(nn.Module):
             torch.manual_seed(seed)
             self.input_conv = nn.Conv2d(3, channels, 3, padding=1, bias=False)
             self.recurrent_conv = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+            self.mix_conv = nn.Conv2d(channels, channels, 1, bias=False)
+            nn.init.orthogonal_(self.mix_conv.weight.reshape(channels, channels))
         self.eval().requires_grad_(False)
 
     @torch.no_grad()
@@ -231,15 +243,26 @@ class ToyImageReservoir(nn.Module):
         base = self.input_conv(image)
         state = torch.zeros_like(base)
         states = []
-        for _ in range(self.steps):
-            state = torch.tanh(base + 0.75 * self.recurrent_conv(state))
+        leak_rates = torch.linspace(0.35, 0.80, self.steps).tolist()
+        for leak in leak_rates:
+            state = torch.tanh(
+                base
+                + float(leak) * self.recurrent_conv(state)
+                + 0.15 * self.mix_conv(state)
+            )
             states.append(state.detach().cpu())
         features = torch.stack(states, dim=0).unsqueeze(1)[:, :, 0]
         h, w = image.shape[-2:]
+        aux_features = fixed_albedo_features(image[0].detach().cpu())
         return ReservoirState(
             features=features,
             output_size=(h, w),
             sigmas=torch.linspace(1, 0, self.steps),
             layer_indices=(0,),
             source="voir/ToyImageReservoir",
+            aux_features=aux_features,
+            metadata={
+                "trajectory_channels": int(self.steps * self.channels),
+                "auxiliary_channels": int(aux_features.shape[0]),
+            },
         ).validate()
