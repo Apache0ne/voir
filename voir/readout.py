@@ -7,12 +7,19 @@ import torch.nn.functional as F
 from .state import ReservoirState
 
 
+def _group_count(channels: int, maximum: int = 16) -> int:
+    groups = min(int(maximum), int(channels))
+    while groups > 1 and channels % groups:
+        groups -= 1
+    return groups
+
+
 class ResidualBlock(nn.Module):
+    """Legacy two-convolution block retained for old checkpoints."""
+
     def __init__(self, channels: int):
         super().__init__()
-        groups = min(16, channels)
-        while channels % groups:
-            groups -= 1
+        groups = _group_count(channels)
         self.net = nn.Sequential(
             nn.GroupNorm(groups, channels),
             nn.SiLU(),
@@ -26,31 +33,113 @@ class ResidualBlock(nn.Module):
         return x + self.net(x)
 
 
-class AlbedoReadout(nn.Module):
-    """Trainable dense readout; the reservoir itself remains fixed."""
+class DilatedResidualBlock(nn.Module):
+    """Large-receptive-field residual block used by the v2 dense readout."""
 
-    def __init__(self, in_channels: int, width: int = 96, depth: int = 4):
+    def __init__(self, channels: int, dilation: int):
+        super().__init__()
+        groups = _group_count(channels, maximum=8)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv2d(
+            channels,
+            channels,
+            3,
+            padding=int(dilation),
+            dilation=int(dilation),
+        )
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = F.silu(self.norm1(x))
+        residual = self.conv1(residual)
+        residual = F.silu(self.norm2(residual))
+        residual = self.conv2(residual)
+        return x + residual
+
+
+def _dilations(depth: int) -> tuple[int, ...]:
+    if depth < 1:
+        raise ValueError("depth must be >= 1")
+    canonical = (1, 2, 4, 8, 4, 2, 1)
+    if depth <= len(canonical):
+        return canonical[:depth]
+    return tuple(canonical[index % len(canonical)] for index in range(depth))
+
+
+class AlbedoReadout(nn.Module):
+    """Trainable dense readout; every reservoir and auxiliary feature is fixed."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        width: int = 32,
+        depth: int = 7,
+        architecture: str = "dilated_v2",
+    ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.width = int(width)
         self.depth = int(depth)
-        self.input = nn.Conv2d(in_channels, width, 1)
-        self.blocks = nn.Sequential(*[ResidualBlock(width) for _ in range(depth)])
-        self.output = nn.Sequential(
-            nn.GroupNorm(min(16, width), width),
-            nn.SiLU(),
-            nn.Conv2d(width, 3, 3, padding=1),
-        )
+        self.architecture = str(architecture)
 
-    def forward(self, features: torch.Tensor, output_size: tuple[int, int] | None = None) -> torch.Tensor:
+        if self.architecture == "legacy":
+            self.input = nn.Conv2d(self.in_channels, self.width, 1)
+            self.blocks = nn.Sequential(*[ResidualBlock(self.width) for _ in range(self.depth)])
+            self.output = nn.Sequential(
+                nn.GroupNorm(_group_count(self.width), self.width),
+                nn.SiLU(),
+                nn.Conv2d(self.width, 3, 3, padding=1),
+            )
+        elif self.architecture == "dilated_v2":
+            self.inp = nn.Conv2d(self.in_channels, self.width, 1)
+            self.blocks = nn.ModuleList(
+                [DilatedResidualBlock(self.width, dilation) for dilation in _dilations(self.depth)]
+            )
+            self.global_fc = nn.Sequential(
+                nn.Linear(self.width, self.width),
+                nn.SiLU(),
+                nn.Linear(self.width, self.width),
+            )
+            self.out = nn.Sequential(
+                nn.GroupNorm(_group_count(self.width, maximum=8), self.width),
+                nn.SiLU(),
+                nn.Conv2d(self.width, 3, 3, padding=1),
+            )
+        else:
+            raise ValueError(f"unknown readout architecture: {self.architecture}")
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        output_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         if features.ndim != 4:
             raise ValueError("features must be [B,C,H,W]")
-        x = self.output(self.blocks(self.input(features)))
-        if output_size is not None and tuple(x.shape[-2:]) != tuple(output_size):
-            x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
-        return torch.sigmoid(x)
+        if features.shape[1] != self.in_channels:
+            raise ValueError(
+                f"readout expects {self.in_channels} channels, received {features.shape[1]}"
+            )
 
-    def predict_state(self, state: ReservoirState, device: str | torch.device = "cpu") -> torch.Tensor:
+        if self.architecture == "legacy":
+            logits = self.output(self.blocks(self.input(features)))
+        else:
+            hidden = self.inp(features)
+            context = self.global_fc(hidden.mean(dim=(-2, -1))).unsqueeze(-1).unsqueeze(-1)
+            hidden = hidden + context
+            for block in self.blocks:
+                hidden = block(hidden)
+            logits = self.out(hidden)
+
+        if output_size is not None and tuple(logits.shape[-2:]) != tuple(output_size):
+            logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
+        return torch.sigmoid(logits)
+
+    def predict_state(
+        self,
+        state: ReservoirState,
+        device: str | torch.device = "cpu",
+    ) -> torch.Tensor:
         self.eval()
         with torch.inference_mode():
             return self(state.flattened(device), state.output_size)
@@ -58,13 +147,25 @@ class AlbedoReadout(nn.Module):
     def checkpoint(self) -> dict:
         return {
             "model": self.state_dict(),
-            "config": {"in_channels": self.in_channels, "width": self.width, "depth": self.depth},
+            "config": {
+                "in_channels": self.in_channels,
+                "width": self.width,
+                "depth": self.depth,
+                "architecture": self.architecture,
+            },
             "task": "albedo",
+            "format_version": 2,
         }
 
     @classmethod
-    def from_checkpoint(cls, payload: dict, map_location: str | torch.device = "cpu") -> "AlbedoReadout":
-        config = payload["config"]
+    def from_checkpoint(
+        cls,
+        payload: dict,
+        map_location: str | torch.device = "cpu",
+    ) -> "AlbedoReadout":
+        config = dict(payload["config"])
+        if "architecture" not in config:
+            config["architecture"] = "legacy"
         model = cls(**config)
         model.load_state_dict(payload["model"])
         return model.to(map_location)
