@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 
 @dataclass
@@ -17,6 +18,7 @@ class ReservoirState:
     layer_indices: tuple[int, ...]
     source: str = "unknown"
     metadata: dict[str, Any] = field(default_factory=dict)
+    aux_features: torch.Tensor | None = None
 
     def validate(self) -> "ReservoirState":
         if self.features.ndim != 5:
@@ -27,16 +29,36 @@ class ReservoirState:
             raise ValueError("one model-evaluation sigma is required for every captured state")
         if self.features.shape[1] != len(self.layer_indices):
             raise ValueError("layer_indices does not match feature layer axis")
+        if self.aux_features is not None:
+            if self.aux_features.ndim != 3:
+                raise ValueError("aux_features must be [C,H,W]")
+            if not torch.isfinite(self.aux_features).all():
+                raise ValueError("aux_features contain non-finite values")
+        if not torch.isfinite(self.features).all():
+            raise ValueError("features contain non-finite values")
         return self
 
     @property
-    def readout_channels(self) -> int:
+    def trajectory_channels(self) -> int:
         return int(self.features.shape[0] * self.features.shape[1] * self.features.shape[2])
+
+    @property
+    def auxiliary_channels(self) -> int:
+        return 0 if self.aux_features is None else int(self.aux_features.shape[0])
+
+    @property
+    def readout_channels(self) -> int:
+        return self.trajectory_channels + self.auxiliary_channels
 
     def flattened(self, device: str | torch.device | None = None) -> torch.Tensor:
         self.validate()
         t, l, c, h, w = self.features.shape
         x = self.features.reshape(1, t * l * c, h, w)
+        if self.aux_features is not None:
+            aux = self.aux_features.unsqueeze(0)
+            if tuple(aux.shape[-2:]) != (h, w):
+                aux = F.interpolate(aux.float(), size=(h, w), mode="bilinear", align_corners=False)
+            x = torch.cat([x, aux.to(dtype=x.dtype)], dim=1)
         return x.to(device) if device is not None else x
 
     def save(self, path: str | Path) -> None:
@@ -45,6 +67,8 @@ class ReservoirState:
         payload = asdict(self)
         payload["features"] = self.features.detach().cpu()
         payload["sigmas"] = self.sigmas.detach().cpu()
+        if self.aux_features is not None:
+            payload["aux_features"] = self.aux_features.detach().cpu()
         torch.save(payload, path)
 
     @classmethod
@@ -52,4 +76,5 @@ class ReservoirState:
         payload = torch.load(Path(path), map_location=map_location, weights_only=False)
         payload["output_size"] = tuple(payload["output_size"])
         payload["layer_indices"] = tuple(payload["layer_indices"])
+        payload.setdefault("aux_features", None)
         return cls(**payload).validate()
