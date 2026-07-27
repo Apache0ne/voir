@@ -22,7 +22,7 @@ def masked_mean(value: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> t
 
 
 def charbonnier(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-    return torch.sqrt((pred - target).square() + eps * eps).mean()
+    return (torch.sqrt((pred - target).square() + eps * eps) - eps).mean()
 
 
 def masked_charbonnier(
@@ -31,7 +31,8 @@ def masked_charbonnier(
     mask: torch.Tensor,
     eps: float = 1e-3,
 ) -> torch.Tensor:
-    return masked_mean(torch.sqrt((pred - target).square() + eps * eps), mask)
+    residual = torch.sqrt((pred - target).square() + eps * eps) - eps
+    return masked_mean(residual, mask)
 
 
 def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -76,12 +77,37 @@ def masked_multiscale_loss(
     kernel = max(1, min(int(factor), height, width))
     if mask.ndim == 3:
         mask = mask.unsqueeze(1)
+    mask = mask.to(device=pred.device, dtype=pred.dtype).clamp(0.0, 1.0)
     if kernel == 1:
         return masked_mean((pred - target).abs(), mask)
-    pred_small = F.avg_pool2d(pred, kernel_size=kernel, stride=kernel)
-    target_small = F.avg_pool2d(target, kernel_size=kernel, stride=kernel)
-    mask_small = F.avg_pool2d(mask.float(), kernel_size=kernel, stride=kernel)
-    return masked_mean((pred_small - target_small).abs(), mask_small)
+    denominator = F.avg_pool2d(mask, kernel_size=kernel, stride=kernel).clamp_min(1e-6)
+    pred_small = F.avg_pool2d(pred * mask, kernel_size=kernel, stride=kernel) / denominator
+    target_small = F.avg_pool2d(target * mask, kernel_size=kernel, stride=kernel) / denominator
+    valid = (denominator > 1e-5).to(pred.dtype)
+    return masked_mean((pred_small - target_small).abs(), valid)
+
+
+def _masked_local_moments(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    kernel: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    mask = mask.to(device=pred.device, dtype=pred.dtype).clamp(0.0, 1.0)
+    padding = kernel // 2
+    weight = F.avg_pool2d(mask, kernel, stride=1, padding=padding).clamp_min(1e-6)
+    mu_pred = F.avg_pool2d(pred * mask, kernel, stride=1, padding=padding) / weight
+    mu_target = F.avg_pool2d(target * mask, kernel, stride=1, padding=padding) / weight
+    second_pred = F.avg_pool2d(pred.square() * mask, kernel, stride=1, padding=padding) / weight
+    second_target = F.avg_pool2d(target.square() * mask, kernel, stride=1, padding=padding) / weight
+    cross = F.avg_pool2d(pred * target * mask, kernel, stride=1, padding=padding) / weight
+    var_pred = (second_pred - mu_pred.square()).clamp_min(0.0)
+    var_target = (second_target - mu_target.square()).clamp_min(0.0)
+    covariance = cross - mu_pred * mu_target
+    valid = (weight > 1e-5).to(pred.dtype)
+    return mu_pred, mu_target, var_pred, var_target, covariance, valid
 
 
 def masked_local_ssim_loss(
@@ -93,12 +119,9 @@ def masked_local_ssim_loss(
     kernel = max(1, min(int(window), pred.shape[-2], pred.shape[-1]))
     if kernel % 2 == 0:
         kernel -= 1
-    padding = kernel // 2
-    mu_pred = F.avg_pool2d(pred, kernel, stride=1, padding=padding)
-    mu_target = F.avg_pool2d(target, kernel, stride=1, padding=padding)
-    var_pred = F.avg_pool2d(pred.square(), kernel, stride=1, padding=padding) - mu_pred.square()
-    var_target = F.avg_pool2d(target.square(), kernel, stride=1, padding=padding) - mu_target.square()
-    covariance = F.avg_pool2d(pred * target, kernel, stride=1, padding=padding) - mu_pred * mu_target
+    mu_pred, mu_target, var_pred, var_target, covariance, valid = _masked_local_moments(
+        pred, target, mask, kernel
+    )
     c1 = 0.01**2
     c2 = 0.03**2
     score = (
@@ -106,7 +129,7 @@ def masked_local_ssim_loss(
         * (2 * covariance + c2)
         / ((mu_pred.square() + mu_target.square() + c1) * (var_pred + var_target + c2))
     )
-    return 1.0 - masked_mean(score, mask)
+    return 1.0 - masked_mean(score, valid)
 
 
 def masked_chromaticity_loss(
