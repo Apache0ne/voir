@@ -16,7 +16,7 @@ permissions:
 jobs:
   train-real30:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,13 +44,13 @@ jobs:
           test "$(wc -l < datasets/hf_olbedo_real30/validation_pairs.jsonl)" -eq 6
       - name: Unit tests
         run: pytest
-      - name: Train and select real-photo readout on CPU
-        run: python scripts/train_real_olbedo_cpu.py --quick --threads 4
+      - name: Full real-photo architecture search and refinement on CPU
+        run: python scripts/train_real_olbedo_cpu.py --threads 4
       - name: Show report
         run: cat outputs/real_olbedo_cpu_v3/report.json
       - uses: actions/upload-artifact@v4
         with:
-          name: voir-real-olbedo-cpu-v3
+          name: voir-real-olbedo-cpu-v3-full
           path: |
             outputs/real_olbedo_cpu_v3
             datasets/hf_olbedo_real30/metadata.json
