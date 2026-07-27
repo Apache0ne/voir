@@ -126,14 +126,39 @@ class MageEditReservoir:
         repo: str = "microsoft/Mage-Flow-Edit-Turbo",
         device: str = "cuda",
         config: CaptureConfig | None = None,
+        attn_backend: str = "sdpa",
     ) -> "MageEditReservoir":
+        """Load Mage while forcing one attention backend before model construction.
+
+        Mage's repository loader currently constructs ``ModelConfig`` without
+        passing ``attn_type``. Its default is ``flash2``, which makes both the DiT
+        and Qwen3-VL text encoder request FlashAttention2 before callers can switch
+        to SDPA. Temporarily wrapping the loader's ``ModelConfig`` global ensures
+        the requested backend is present while every component is constructed.
+        """
+        if attn_backend not in {"sdpa", "flash2", "flash4"}:
+            raise ValueError("attn_backend must be one of: sdpa, flash2, flash4")
         try:
-            from mage_flow.pipeline import MageFlowPipeline
+            import mage_flow.pipeline as mage_pipeline
+            from mage_flow.models.modules._attn_backend import set_attn_backend
         except ImportError as exc:
             raise RuntimeError(
                 "The Microsoft Mage source package is required. Clone microsoft/Mage and install it editable."
             ) from exc
-        pipe = MageFlowPipeline.from_pretrained(repo, device=device)
+
+        original_model_config = mage_pipeline.ModelConfig
+
+        def configured_model_config(*args, **kwargs):
+            kwargs["attn_type"] = attn_backend
+            return original_model_config(*args, **kwargs)
+
+        set_attn_backend(attn_backend)
+        mage_pipeline.ModelConfig = configured_model_config
+        try:
+            pipe = mage_pipeline.MageFlowPipeline.from_pretrained(repo, device=device)
+        finally:
+            mage_pipeline.ModelConfig = original_model_config
+        set_attn_backend(attn_backend)
         return cls(pipe, config=config)
 
     @torch.no_grad()
