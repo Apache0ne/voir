@@ -9,7 +9,7 @@ import torch.nn as nn
 from PIL import Image
 
 from .albedo_features import fixed_albedo_features
-from .mage_sampler import MageDPMppSDEEditSampler, MageSamplerConfig
+from .mage_sampler import MageDPMppSDEEditSampler, MageSamplerCache, MageSamplerConfig
 from .projection import feature_hash_project
 from .state import ReservoirState
 
@@ -144,6 +144,18 @@ class MageEditReservoir:
         seed: int = 42,
         max_size: int = 512,
     ) -> tuple[ReservoirState, Image.Image]:
+        state, edited, _ = self.capture_detailed(image, prompt=prompt, seed=seed, max_size=max_size)
+        return state, edited
+
+    @torch.no_grad()
+    def capture_detailed(
+        self,
+        image: Image.Image | str | Path,
+        prompt: str = "remove illumination, shadows, highlights, and reflections; output diffuse albedo only",
+        seed: int = 42,
+        max_size: int = 512,
+    ) -> tuple[ReservoirState, Image.Image, MageSamplerCache]:
+        """Capture projected hidden states plus the complete sampler/conditioning cache."""
         if isinstance(image, (str, Path)):
             image = Image.open(image)
         image = image.convert("RGB")
@@ -172,7 +184,7 @@ class MageEditReservoir:
             (out_h, out_w),
             num_refs=1,
         ) as collector:
-            edited, trace, _ = sampler.edit(
+            result = sampler.edit_detailed(
                 image,
                 prompt,
                 seed=int(seed),
@@ -180,7 +192,10 @@ class MageEditReservoir:
                 height=out_h,
                 width=out_w,
                 on_model_eval=collector.begin_eval,
+                capture_cache=True,
             )
+        if result.cache is None:
+            raise RuntimeError("detailed Mage capture did not return a sampler cache")
         features, eval_sigmas = collector.stack()
 
         resized = image.resize((out_w, out_h), Image.Resampling.BICUBIC)
@@ -198,13 +213,14 @@ class MageEditReservoir:
                 "prompt": prompt,
                 "seed": int(seed),
                 "projection_channels": self.config.projection_channels,
-                "sampler": trace.sampler,
-                "schedule_sigmas": trace.schedule_sigmas.tolist(),
-                "model_eval_sigmas": trace.model_eval_sigmas.tolist(),
-                "noise_backend": trace.noise_backend,
-                "eta": trace.eta,
-                "s_noise": trace.s_noise,
-                "r": trace.r,
+                "projection_seed": self.config.projection_seed,
+                "sampler": result.trace.sampler,
+                "schedule_sigmas": result.trace.schedule_sigmas.tolist(),
+                "model_eval_sigmas": result.trace.model_eval_sigmas.tolist(),
+                "noise_backend": result.trace.noise_backend,
+                "eta": result.trace.eta,
+                "s_noise": result.trace.s_noise,
+                "r": result.trace.r,
                 "beta_alpha": self.config.alpha,
                 "beta_beta": self.config.beta,
                 "sigma_start": self.config.start,
@@ -212,9 +228,11 @@ class MageEditReservoir:
                 "shift": self.config.shift,
                 "trajectory_channels": int(features.shape[0] * features.shape[1] * features.shape[2]),
                 "auxiliary_channels": int(aux_features.shape[0]),
+                "sampler_cache_format": "voir_mage_sampler_cache_v1",
+                "sampler_model_evaluations": int(result.cache.model_eval_sigmas.numel()),
             },
         ).validate()
-        return state, edited
+        return state, result.output, result.cache
 
 
 class ToyImageReservoir(nn.Module):
