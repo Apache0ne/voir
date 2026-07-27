@@ -13,6 +13,7 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,27 +22,36 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip datasets Pillow
-      - name: Download thirty real photos from Hugging Face
+      - name: Download 30 paired real RGB and albedo images from Hugging Face
         run: |
-          rm -rf datasets/hf_coco_real30
+          rm -rf datasets/hf_olbedo_real30
           python scripts/download_hf_real30.py \
-            --dataset detection-datasets/coco \
-            --split train \
+            --dataset GDAOSU/Olbedo \
+            --split train_selected \
             --count 30 \
-            --output datasets/hf_coco_real30
+            --train-count 24 \
+            --stride 17 \
+            --output datasets/hf_olbedo_real30
+      - name: Validate the snapshot
+        run: |
+          test "$(find datasets/hf_olbedo_real30/images -name '*.png' | wc -l)" -eq 30
+          test "$(find datasets/hf_olbedo_real30/albedo -name '*.png' | wc -l)" -eq 30
+          test "$(find datasets/hf_olbedo_real30/masks -name '*.png' | wc -l)" -eq 30
+          test "$(wc -l < datasets/hf_olbedo_real30/train_pairs.jsonl)" -eq 24
+          test "$(wc -l < datasets/hf_olbedo_real30/validation_pairs.jsonl)" -eq 6
       - name: Commit dataset snapshot
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add datasets/hf_coco_real30
+          git add datasets/hf_olbedo_real30
           if git diff --cached --quiet; then
             echo "Dataset snapshot already current"
           else
-            git commit -m "Add HF COCO real30 photo set"
+            git commit -m "Add HF Olbedo real30 paired subset"
             git push
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: hf-coco-real30
-          path: datasets/hf_coco_real30
+          name: hf-olbedo-real30
+          path: datasets/hf_olbedo_real30
           if-no-files-found: error
