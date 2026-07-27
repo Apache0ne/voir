@@ -2,96 +2,134 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 from datasets import load_dataset
 from PIL import Image
 
 
-def _extract_labels(example: dict) -> list[int]:
-    objects = example.get("objects") or {}
-    categories = objects.get("category") or objects.get("categories") or []
-    return [int(value) for value in categories]
+def _as_rgb(value) -> Image.Image:
+    if isinstance(value, Image.Image):
+        return value.convert("RGB")
+    return Image.open(value).convert("RGB")
+
+
+def _as_mask(value, size: tuple[int, int]) -> Image.Image:
+    if value is None:
+        return Image.new("L", size, 255)
+    if isinstance(value, Image.Image):
+        return value.convert("L")
+    return Image.open(value).convert("L")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="detection-datasets/coco")
-    parser.add_argument("--split", default="train")
+    parser = argparse.ArgumentParser(
+        description="Download a tiny paired real-photo/albedo subset from Hugging Face."
+    )
+    parser.add_argument("--dataset", default="GDAOSU/Olbedo")
+    parser.add_argument("--split", default="train_selected")
     parser.add_argument("--count", type=int, default=30)
-    parser.add_argument("--output", default="datasets/hf_coco_real30")
-    parser.add_argument("--min-side", type=int, default=480)
-    parser.add_argument("--max-scan", type=int, default=2000)
+    parser.add_argument("--train-count", type=int, default=24)
+    parser.add_argument("--stride", type=int, default=17)
+    parser.add_argument("--output", default="datasets/hf_olbedo_real30")
     args = parser.parse_args()
 
+    if args.count < 2:
+        raise ValueError("count must be at least 2")
+    if not 1 <= args.train_count < args.count:
+        raise ValueError("train-count must be between 1 and count-1")
+    if args.stride < 1:
+        raise ValueError("stride must be >= 1")
+
     output = Path(args.output)
+    if output.exists():
+        shutil.rmtree(output)
     image_dir = output / "images"
-    image_dir.mkdir(parents=True, exist_ok=True)
+    albedo_dir = output / "albedo"
+    mask_dir = output / "masks"
+    image_dir.mkdir(parents=True)
+    albedo_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
 
     stream = load_dataset(args.dataset, split=args.split, streaming=True)
     records: list[dict] = []
-    seen_label_sets: set[tuple[int, ...]] = set()
 
     for scanned, example in enumerate(stream):
-        if scanned >= args.max_scan or len(records) >= args.count:
-            break
-        image = example.get("image")
-        if image is None:
+        if scanned % args.stride != 0:
             continue
-        if not isinstance(image, Image.Image):
-            image = Image.open(image)
-        image = image.convert("RGB")
-        width, height = image.size
-        if min(width, height) < args.min_side:
+        image_value = example.get("image")
+        albedo_value = example.get("albedo")
+        if image_value is None or albedo_value is None:
             continue
 
-        labels = _extract_labels(example)
-        label_key = tuple(sorted(set(labels)))
-        # Prefer diverse scenes for this tiny real-photo adaptation set.
-        if label_key and label_key in seen_label_sets and len(records) < args.count - 5:
-            continue
-        if label_key:
-            seen_label_sets.add(label_key)
+        image = _as_rgb(image_value)
+        albedo = _as_rgb(albedo_value)
+        if albedo.size != image.size:
+            albedo = albedo.resize(image.size, Image.Resampling.BICUBIC)
+        mask = _as_mask(example.get("mask"), image.size)
+        if mask.size != image.size:
+            mask = mask.resize(image.size, Image.Resampling.NEAREST)
 
         index = len(records)
-        filename = f"{index:03d}.jpg"
-        image.save(image_dir / filename, quality=95, subsampling=0)
-        source_id = example.get("image_id", example.get("id", scanned))
-        records.append(
-            {
-                "index": index,
-                "image": f"images/{filename}",
-                "source_dataset": args.dataset,
-                "source_split": args.split,
-                "source_id": int(source_id) if isinstance(source_id, (int, float)) else str(source_id),
-                "width": width,
-                "height": height,
-                "object_category_ids": labels,
-                "albedo_target": None,
-                "target_type": "pending_real_photo_pseudo_label",
-            }
-        )
+        stem = f"{index:03d}"
+        image_path = image_dir / f"{stem}.png"
+        albedo_path = albedo_dir / f"{stem}.png"
+        mask_path = mask_dir / f"{stem}.png"
+        image.save(image_path, optimize=True)
+        albedo.save(albedo_path, optimize=True)
+        mask.save(mask_path, optimize=True)
+
+        subset = "train" if index < args.train_count else "validation"
+        record = {
+            "index": index,
+            "subset": subset,
+            "image": str(image_path.relative_to(output)),
+            "albedo": str(albedo_path.relative_to(output)),
+            "mask": str(mask_path.relative_to(output)),
+            "source_dataset": args.dataset,
+            "source_split": args.split,
+            "source_row": scanned,
+            "frame_id": int(example.get("frame_id", scanned)),
+            "scene": str(example.get("scene", "")),
+            "date": str(example.get("date", "")),
+            "lighting": str(example.get("lighting", "")),
+            "width": image.width,
+            "height": image.height,
+            "target_type": "paired_multiview_consistent_albedo",
+        }
+        records.append(record)
+        if len(records) == args.count:
+            break
 
     if len(records) != args.count:
-        raise RuntimeError(f"requested {args.count} images but selected {len(records)}")
+        raise RuntimeError(f"requested {args.count} pairs but downloaded {len(records)}")
 
-    manifest = output / "manifest.jsonl"
-    manifest.write_text(
-        "".join(json.dumps(record) + "\n" for record in records),
-        encoding="utf-8",
-    )
+    def write_manifest(name: str, selected: list[dict]) -> None:
+        (output / name).write_text(
+            "".join(json.dumps(record) + "\n" for record in selected),
+            encoding="utf-8",
+        )
+
+    write_manifest("pairs.jsonl", records)
+    write_manifest("train_pairs.jsonl", records[: args.train_count])
+    write_manifest("validation_pairs.jsonl", records[args.train_count :])
+
     metadata = {
         "dataset": args.dataset,
         "split": args.split,
         "count": len(records),
-        "selection": {
-            "real_photos_only": True,
-            "minimum_side": args.min_side,
-            "diverse_object_sets": True,
-            "deterministic_stream_order": True,
-        },
-        "purpose": "real-photo albedo adaptation and validation",
-        "note": "These are real RGB photos. Albedo targets must be generated or manually supplied before supervised training.",
+        "train_pairs": args.train_count,
+        "validation_pairs": args.count - args.train_count,
+        "stride": args.stride,
+        "license": "cc-by-4.0",
+        "contents": ["real UAV RGB photo", "paired albedo", "confidence/validity mask"],
+        "purpose": "first real-photo supervised adaptation of the VOIR albedo readout",
+        "note": (
+            "Olbedo contains real UAV images with albedo targets derived by a calibrated "
+            "multi-view inverse-rendering pipeline. It is substantially more suitable than "
+            "unpaired COCO photos for supervised albedo training."
+        ),
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2))
