@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from PIL import Image
@@ -27,12 +27,128 @@ class MageSamplerConfig:
     prefer_torchsde: bool = True
 
 
+def _cpu_tensor(value: torch.Tensor | None, float_dtype: torch.dtype = torch.float16) -> torch.Tensor | None:
+    if value is None:
+        return None
+    result = value.detach().cpu().contiguous()
+    if result.is_floating_point():
+        result = result.to(float_dtype)
+    return result
+
+
+def _python_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, tuple):
+        return tuple(_python_value(item) for item in value)
+    if isinstance(value, list):
+        return [_python_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _python_value(item) for key, item in value.items()}
+    return value
+
+
+@dataclass
+class MageSamplerCache:
+    """Portable CPU cache for one complete Mage edit trajectory.
+
+    Large floating-point tensors are stored as float16. The cache includes the
+    reference VAE tokens, initial/final target tokens, conditioning tensors, and
+    every DPM++ SDE model-evaluation latent, denoised estimate, and velocity.
+    """
+
+    reference_tokens: torch.Tensor
+    reference_ids: torch.Tensor
+    reference_shapes: Any
+    initial_target_tokens: torch.Tensor
+    final_target_tokens: torch.Tensor
+    target_ids: torch.Tensor
+    image_ids: torch.Tensor
+    image_cu: torch.Tensor
+    image_shapes: Any
+    text_tokens: torch.Tensor
+    text_cu: torch.Tensor
+    text_mask: torch.Tensor | None
+    text_vector: torch.Tensor
+    text_lengths: list[int]
+    schedule_sigmas: torch.Tensor
+    model_eval_sigmas: torch.Tensor
+    eval_latents: torch.Tensor
+    eval_denoised: torch.Tensor
+    eval_velocity: torch.Tensor
+    eval_solver_indices: torch.Tensor
+    eval_stages: torch.Tensor
+    target_grid: tuple[int, int]
+    output_size: tuple[int, int]
+    packed_length: int
+    target_length: int
+    metadata: dict[str, Any]
+
+    def validate(self) -> "MageSamplerCache":
+        evaluations = int(self.model_eval_sigmas.numel())
+        for name, tensor in (
+            ("eval_latents", self.eval_latents),
+            ("eval_denoised", self.eval_denoised),
+            ("eval_velocity", self.eval_velocity),
+        ):
+            if tensor.ndim != 4 or tensor.shape[0] != evaluations:
+                raise ValueError(f"{name} must be [T,B,N,C] with T={evaluations}")
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"{name} contains non-finite values")
+        if self.eval_solver_indices.numel() != evaluations or self.eval_stages.numel() != evaluations:
+            raise ValueError("solver indices and stages must match model evaluations")
+        if self.initial_target_tokens.shape != self.final_target_tokens.shape:
+            raise ValueError("initial and final target token shapes must match")
+        if self.initial_target_tokens.shape[1] != self.target_length:
+            raise ValueError("target_length does not match target token tensor")
+        return self
+
+    def to_payload(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "reference_tokens": self.reference_tokens,
+            "reference_ids": self.reference_ids,
+            "reference_shapes": self.reference_shapes,
+            "initial_target_tokens": self.initial_target_tokens,
+            "final_target_tokens": self.final_target_tokens,
+            "target_ids": self.target_ids,
+            "image_ids": self.image_ids,
+            "image_cu": self.image_cu,
+            "image_shapes": self.image_shapes,
+            "text_tokens": self.text_tokens,
+            "text_cu": self.text_cu,
+            "text_mask": self.text_mask,
+            "text_vector": self.text_vector,
+            "text_lengths": self.text_lengths,
+            "schedule_sigmas": self.schedule_sigmas,
+            "model_eval_sigmas": self.model_eval_sigmas,
+            "eval_latents": self.eval_latents,
+            "eval_denoised": self.eval_denoised,
+            "eval_velocity": self.eval_velocity,
+            "eval_solver_indices": self.eval_solver_indices,
+            "eval_stages": self.eval_stages,
+            "target_grid": self.target_grid,
+            "output_size": self.output_size,
+            "packed_length": self.packed_length,
+            "target_length": self.target_length,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class MageDetailedEditResult:
+    output: Image.Image
+    trace: SamplerTrace
+    target_length: int
+    cache: MageSamplerCache | None
+
+
 class MageDPMppSDEEditSampler:
     """Standalone Mage-Flow-Edit sampler using Beta + DPM++ SDE device noise.
 
     This class does not import or call ComfyUI. The scheduler and solver are ports
     of the relevant source equations, adapted to Mage's rectified-flow velocity:
-    x0 = x_sigma - sigma * velocity.
+    ``x0 = x_sigma - sigma * velocity``.
     """
 
     def __init__(self, pipeline, config: MageSamplerConfig | None = None):
@@ -61,6 +177,35 @@ class MageDPMppSDEEditSampler:
         gs_key=None,
         on_model_eval: Callable[[float, int], None] | None = None,
     ) -> tuple[Image.Image, SamplerTrace, int]:
+        """Legacy compact API retained for existing callers."""
+        result = self.edit_detailed(
+            image,
+            prompt,
+            seed=seed,
+            max_size=max_size,
+            height=height,
+            width=width,
+            gs_key=gs_key,
+            on_model_eval=on_model_eval,
+            capture_cache=False,
+        )
+        return result.output, result.trace, result.target_length
+
+    @torch.no_grad()
+    def edit_detailed(
+        self,
+        image: Image.Image | str | Path | Sequence[Image.Image | str | Path],
+        prompt: str,
+        *,
+        seed: int = 42,
+        max_size: int | None = 512,
+        height: int | None = None,
+        width: int | None = None,
+        gs_key=None,
+        on_model_eval: Callable[[float, int], None] | None = None,
+        on_sampler_eval: Callable[[dict[str, Any]], None] | None = None,
+        capture_cache: bool = True,
+    ) -> MageDetailedEditResult:
         try:
             from einops import rearrange
             from mage_flow.pipeline import (
@@ -117,6 +262,7 @@ class MageDPMppSDEEditSampler:
         )
         _, _, gh, gw = noise.shape
         target = rearrange(noise, "b c h w -> b (h w) c").float()
+        initial_target = target.detach().clone()
         target_len = target.shape[1]
 
         target_ids = torch.zeros(gh, gw, 3, device=dev)
@@ -168,6 +314,11 @@ class MageDPMppSDEEditSampler:
             device=dev,
         )
         eval_index = 0
+        velocity_evals: list[torch.Tensor] = []
+        latent_evals: list[torch.Tensor] = []
+        denoised_evals: list[torch.Tensor] = []
+        solver_indices: list[int] = []
+        stages: list[int] = []
 
         def predict_x0(x: torch.Tensor, sigma_batch: torch.Tensor) -> torch.Tensor:
             nonlocal eval_index
@@ -178,8 +329,19 @@ class MageDPMppSDEEditSampler:
             packed = torch.cat([x.to(ref_tok.dtype), ref_tok], dim=1)
             velocity = _velocity(self.model.transformer, packed, ctx, sigma_value)
             velocity_target = velocity[:, :target_len].float()
+            if capture_cache:
+                velocity_evals.append(_cpu_tensor(velocity_target))
             sigma_view = sigma_batch.reshape(-1, *([1] * (x.ndim - 1))).to(x.dtype)
             return x - sigma_view * velocity_target
+
+        def sampler_callback(payload: dict[str, Any]) -> None:
+            if capture_cache:
+                latent_evals.append(_cpu_tensor(payload["x"]))
+                denoised_evals.append(_cpu_tensor(payload["denoised"]))
+                solver_indices.append(int(payload["i"]))
+                stages.append(int(payload["stage"]))
+            if on_sampler_eval is not None:
+                on_sampler_eval(payload)
 
         sampled, trace = sample_dpmpp_sde_gpu(
             predict_x0,
@@ -190,7 +352,62 @@ class MageDPMppSDEEditSampler:
             s_noise=self.config.s_noise,
             r=self.config.r,
             shift=self.config.shift,
+            callback=sampler_callback,
             prefer_torchsde=self.config.prefer_torchsde,
         )
         output = _decode_one(self.model, sampled, out_h, out_w, dev)
-        return output, trace, target_len
+
+        cache = None
+        if capture_cache:
+            if not (len(latent_evals) == len(denoised_evals) == len(velocity_evals)):
+                raise RuntimeError("sampler cache lists are misaligned")
+            cache = MageSamplerCache(
+                reference_tokens=_cpu_tensor(ref_tok),
+                reference_ids=_cpu_tensor(ref_ids, torch.float32),
+                reference_shapes=_python_value(ref_shapes),
+                initial_target_tokens=_cpu_tensor(initial_target),
+                final_target_tokens=_cpu_tensor(sampled),
+                target_ids=_cpu_tensor(target_ids, torch.float32),
+                image_ids=_cpu_tensor(img_ids, torch.float32),
+                image_cu=_cpu_tensor(img_cu, torch.float32),
+                image_shapes=_python_value(img_shapes),
+                text_tokens=_cpu_tensor(txt),
+                text_cu=_cpu_tensor(txt_cu, torch.float32),
+                text_mask=_cpu_tensor(txt_mask, torch.float32),
+                text_vector=_cpu_tensor(vec),
+                text_lengths=[int(value) for value in text_lens],
+                schedule_sigmas=trace.schedule_sigmas.float().cpu(),
+                model_eval_sigmas=trace.model_eval_sigmas.float().cpu(),
+                eval_latents=torch.stack(latent_evals, dim=0),
+                eval_denoised=torch.stack(denoised_evals, dim=0),
+                eval_velocity=torch.stack(velocity_evals, dim=0),
+                eval_solver_indices=torch.tensor(solver_indices, dtype=torch.int16),
+                eval_stages=torch.tensor(stages, dtype=torch.int8),
+                target_grid=(int(gh), int(gw)),
+                output_size=(int(out_h), int(out_w)),
+                packed_length=int(packed_len),
+                target_length=int(target_len),
+                metadata={
+                    "prompt": prompt,
+                    "seed": int(seed),
+                    "sampler": trace.sampler,
+                    "noise_backend": trace.noise_backend,
+                    "eta": trace.eta,
+                    "s_noise": trace.s_noise,
+                    "r": trace.r,
+                    "beta_alpha": self.config.alpha,
+                    "beta_beta": self.config.beta,
+                    "sigma_start": self.config.start,
+                    "sigma_end": self.config.end,
+                    "shift": self.config.shift,
+                    "train_timesteps": self.config.train_timesteps,
+                    "vl_cond_long_edge": self.config.vl_cond_long_edge,
+                    "template": template,
+                    "template_drop_index": drop_idx,
+                    "reference_count": len(refs),
+                    "latent_channels": int(channels),
+                    "storage_float_dtype": "float16",
+                },
+            ).validate()
+
+        return MageDetailedEditResult(output, trace, target_len, cache)
