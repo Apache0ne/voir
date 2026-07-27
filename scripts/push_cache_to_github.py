@@ -1,7 +1,9 @@
 """Push a generated cache directory to a dedicated GitHub branch.
 
-The GitHub token is read from ``GITHUB_TOKEN`` and is never printed. The remote
-URL is restored to the clean public URL after the push.
+The GitHub token is read from ``GITHUB_TOKEN`` and is never printed. Each push
+rebuilds the cache branch from current ``main`` and uses ``--force-with-lease``;
+this avoids checkout conflicts with restored untracked cache files while still
+protecting against unexpected remote changes.
 """
 from __future__ import annotations
 
@@ -44,12 +46,10 @@ def main() -> None:
     _run(["git", "config", "user.name", "VOIR Colab Cache"], repo_dir)
     _run(["git", "config", "user.email", "voir-cache@users.noreply.github.com"], repo_dir)
     _run(["git", "fetch", "origin", "--prune"], repo_dir)
-    remote_exists = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{args.branch}"],
-        cwd=repo_dir,
-    ).returncode == 0
-    start = f"origin/{args.branch}" if remote_exists else "origin/main"
-    _run(["git", "checkout", "-B", args.branch, start], repo_dir)
+    # The cache directory is untracked on main. Rebuilding the local cache branch
+    # from origin/main preserves those files and avoids conflicts with an older
+    # remote cache branch containing paths with the same names.
+    _run(["git", "checkout", "-B", args.branch, "origin/main"], repo_dir)
     _run(["git", "add", args.path], repo_dir)
     changed = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_dir).returncode != 0
     if changed:
@@ -59,7 +59,7 @@ def main() -> None:
     auth_url = f"https://x-access-token:{quote(token, safe='')}@github.com/{args.repository}.git"
     _run(["git", "remote", "set-url", "origin", auth_url], repo_dir)
     try:
-        _run(["git", "push", "origin", f"HEAD:{args.branch}"], repo_dir)
+        _run(["git", "push", "--force-with-lease", "origin", f"HEAD:{args.branch}"], repo_dir)
     finally:
         _run(["git", "remote", "set-url", "origin", clean_url], repo_dir)
 
