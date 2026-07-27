@@ -39,22 +39,23 @@ class DilatedResidualBlock(nn.Module):
     def __init__(self, channels: int, dilation: int):
         super().__init__()
         groups = _group_count(channels, maximum=8)
-        self.norm1 = nn.GroupNorm(groups, channels)
-        self.conv1 = nn.Conv2d(
+        # Short names intentionally match the validated CPU checkpoint format.
+        self.n1 = nn.GroupNorm(groups, channels)
+        self.c1 = nn.Conv2d(
             channels,
             channels,
             3,
             padding=int(dilation),
             dilation=int(dilation),
         )
-        self.norm2 = nn.GroupNorm(groups, channels)
-        self.conv2 = nn.Conv2d(channels, channels, 1)
+        self.n2 = nn.GroupNorm(groups, channels)
+        self.c2 = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = F.silu(self.norm1(x))
-        residual = self.conv1(residual)
-        residual = F.silu(self.norm2(residual))
-        residual = self.conv2(residual)
+        residual = F.silu(self.n1(x))
+        residual = self.c1(residual)
+        residual = F.silu(self.n2(residual))
+        residual = self.c2(residual)
         return x + residual
 
 
