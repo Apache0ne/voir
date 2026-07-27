@@ -65,11 +65,26 @@ def local_ssim(
     if kernel % 2 == 0:
         kernel -= 1
     padding = kernel // 2
-    mu_pred = F.avg_pool2d(pred, kernel, stride=1, padding=padding)
-    mu_target = F.avg_pool2d(target, kernel, stride=1, padding=padding)
-    var_pred = F.avg_pool2d(pred.square(), kernel, stride=1, padding=padding) - mu_pred.square()
-    var_target = F.avg_pool2d(target.square(), kernel, stride=1, padding=padding) - mu_target.square()
-    covariance = F.avg_pool2d(pred * target, kernel, stride=1, padding=padding) - mu_pred * mu_target
+    if mask is None:
+        mu_pred = F.avg_pool2d(pred, kernel, stride=1, padding=padding)
+        mu_target = F.avg_pool2d(target, kernel, stride=1, padding=padding)
+        var_pred = F.avg_pool2d(pred.square(), kernel, stride=1, padding=padding) - mu_pred.square()
+        var_target = F.avg_pool2d(target.square(), kernel, stride=1, padding=padding) - mu_target.square()
+        covariance = F.avg_pool2d(pred * target, kernel, stride=1, padding=padding) - mu_pred * mu_target
+        valid = None
+    else:
+        base_mask = mask.unsqueeze(1) if mask.ndim == 3 else mask
+        base_mask = base_mask.to(device=pred.device, dtype=pred.dtype).clamp(0.0, 1.0)
+        weight = F.avg_pool2d(base_mask, kernel, stride=1, padding=padding).clamp_min(1e-6)
+        mu_pred = F.avg_pool2d(pred * base_mask, kernel, stride=1, padding=padding) / weight
+        mu_target = F.avg_pool2d(target * base_mask, kernel, stride=1, padding=padding) / weight
+        second_pred = F.avg_pool2d(pred.square() * base_mask, kernel, stride=1, padding=padding) / weight
+        second_target = F.avg_pool2d(target.square() * base_mask, kernel, stride=1, padding=padding) / weight
+        cross = F.avg_pool2d(pred * target * base_mask, kernel, stride=1, padding=padding) / weight
+        var_pred = (second_pred - mu_pred.square()).clamp_min(0.0)
+        var_target = (second_target - mu_target.square()).clamp_min(0.0)
+        covariance = cross - mu_pred * mu_target
+        valid = (weight > 1e-5).to(pred.dtype)
     c1 = 0.01**2
     c2 = 0.03**2
     score = (
@@ -77,7 +92,7 @@ def local_ssim(
         * (2 * covariance + c2)
         / ((mu_pred.square() + mu_target.square() + c1) * (var_pred + var_target + c2))
     )
-    return float(score.mean() if mask is None else _weighted_mean(score, mask))
+    return float(score.mean() if valid is None else _weighted_mean(score, valid))
 
 
 @torch.no_grad()
