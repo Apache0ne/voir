@@ -7,6 +7,7 @@ on:
       - "scripts/download_hf_real30.py"
       - "scripts/train_real_olbedo_cpu.py"
       - "scripts/train_real_olbedo_cpu_focused.py"
+      - "scripts/train_real_olbedo_cpu_crossval.py"
       - "tests/**"
       - ".github/workflows/real-albedo-cpu.yml"
   workflow_dispatch:
@@ -17,7 +18,7 @@ permissions:
 jobs:
   train-real30:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,20 +42,18 @@ jobs:
           test "$(find datasets/hf_olbedo_real30/images -name '*.png' | wc -l)" -eq 30
           test "$(find datasets/hf_olbedo_real30/albedo -name '*.png' | wc -l)" -eq 30
           test "$(find datasets/hf_olbedo_real30/masks -name '*.png' | wc -l)" -eq 30
-          test "$(wc -l < datasets/hf_olbedo_real30/train_pairs.jsonl)" -eq 24
-          test "$(wc -l < datasets/hf_olbedo_real30/validation_pairs.jsonl)" -eq 6
+          test "$(wc -l < datasets/hf_olbedo_real30/pairs.jsonl)" -eq 30
       - name: Unit tests
         run: pytest
-      - name: Focused three-phase real-photo refinement on CPU
-        run: python scripts/train_real_olbedo_cpu_focused.py
+      - name: Five-fold group-held-out training and deployment ensemble
+        run: python scripts/train_real_olbedo_cpu_crossval.py
       - name: Show report
-        run: cat outputs/real_olbedo_cpu_v3_focused/report.json
+        run: cat outputs/real_olbedo_cpu_v3_crossval/report.json
       - uses: actions/upload-artifact@v4
         with:
-          name: voir-real-olbedo-cpu-v3-focused
+          name: voir-real-olbedo-cpu-v3-crossval
           path: |
-            outputs/real_olbedo_cpu_v3_focused
+            outputs/real_olbedo_cpu_v3_crossval
             datasets/hf_olbedo_real30/metadata.json
-            datasets/hf_olbedo_real30/train_pairs.jsonl
-            datasets/hf_olbedo_real30/validation_pairs.jsonl
+            datasets/hf_olbedo_real30/pairs.jsonl
           if-no-files-found: error
