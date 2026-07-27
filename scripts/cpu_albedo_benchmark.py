@@ -1,4 +1,4 @@
-"""Train the frozen-reservoir albedo readout on a disjoint held-out CPU benchmark."""
+"""Train and evaluate the frozen-reservoir albedo readout entirely on CPU."""
 from __future__ import annotations
 
 import argparse
@@ -80,12 +80,122 @@ def _train_phase(
 
 
 @torch.no_grad()
-def _predict(model: AlbedoReadout, features: torch.Tensor, batch_size: int = 8) -> torch.Tensor:
+def _predict(
+    model: AlbedoReadout,
+    features: torch.Tensor,
+    batch_size: int = 8,
+) -> torch.Tensor:
     model.eval()
     return torch.cat(
         [model(features[index:index + batch_size]) for index in range(0, len(features), batch_size)],
         dim=0,
     )
+
+
+@torch.no_grad()
+def _evaluate_seed(
+    model: AlbedoReadout,
+    reservoir: ToyImageReservoir,
+    seed: int,
+    samples: int,
+) -> dict[str, float]:
+    observed, target = synthetic_albedo_benchmark_batch(samples, size=48, seed=seed)
+    features = _capture_batch(reservoir, observed)
+    prediction = _predict(model, features)
+    return albedo_metrics(prediction, target)
+
+
+def _mean_metrics(per_seed: dict[str, dict[str, float]]) -> dict[str, float]:
+    names = next(iter(per_seed.values())).keys()
+    return {
+        name: sum(metrics[name] for metrics in per_seed.values()) / len(per_seed)
+        for name in names
+    }
+
+
+def _online_generalization_phase(
+    model: AlbedoReadout,
+    reservoir: ToyImageReservoir,
+    *,
+    steps: int,
+    batch_size: int,
+    learning_rate: float,
+    eta_min: float,
+    seed_base: int,
+    validation_seeds: tuple[int, ...],
+    validation_samples: int,
+    eval_every: int,
+) -> dict[str, object]:
+    """Fine-tune on newly generated samples and keep the best held-out MAE state."""
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=1e-5,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(steps, 1),
+        eta_min=eta_min,
+    )
+
+    initial = {
+        str(seed): _evaluate_seed(model, reservoir, seed, validation_samples)
+        for seed in validation_seeds
+    }
+    best_score = _mean_metrics(initial)["mae"]
+    best_step = 0
+    best_state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
+    last_loss = 0.0
+
+    for step in range(1, steps + 1):
+        observed, target = synthetic_albedo_benchmark_batch(
+            batch_size,
+            size=48,
+            seed=seed_base + step,
+        )
+        features = _capture_batch(reservoir, observed)
+        model.train()
+        prediction = model(features)
+        loss, _ = albedo_loss(prediction, target)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        last_loss = float(loss.detach())
+
+        if step % eval_every == 0 or step == steps:
+            per_seed = {
+                str(seed): _evaluate_seed(model, reservoir, seed, validation_samples)
+                for seed in validation_seeds
+            }
+            score = _mean_metrics(per_seed)["mae"]
+            if score < best_score:
+                best_score = score
+                best_step = step
+                best_state = {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in model.state_dict().items()
+                }
+
+    model.load_state_dict(best_state)
+    final = {
+        str(seed): _evaluate_seed(model, reservoir, seed, validation_samples)
+        for seed in validation_seeds
+    }
+    return {
+        "steps": steps,
+        "best_step": best_step,
+        "last_loss": last_loss,
+        "learning_rate": learning_rate,
+        "eta_min": eta_min,
+        "seed_base": seed_base,
+        "validation": final,
+        "validation_average": _mean_metrics(final),
+    }
 
 
 def _write_sheet(
@@ -107,9 +217,7 @@ def _write_sheet(
     for row in range(samples):
         error = (prediction[row] - target[row]).abs().mul(4.0).clamp(0.0, 1.0)
         for column, tensor in enumerate((observed[row], target[row], prediction[row], error)):
-            array = (
-                tensor.permute(1, 2, 0).clamp(0.0, 1.0).mul(255).byte().numpy()
-            )
+            array = tensor.permute(1, 2, 0).clamp(0.0, 1.0).mul(255).byte().numpy()
             image = Image.fromarray(array).resize((cell_w, cell_h), Image.Resampling.NEAREST)
             sheet.paste(image, (column * cell_w, header + row * cell_h))
     sheet.save(path)
@@ -128,11 +236,19 @@ def main() -> None:
     started = time.time()
 
     if args.quick:
-        train_small, train_large, validation = 64, 96, 24
-        phase_steps = (30, 30, 30)
+        train_small, train_large = 64, 96
+        offline_steps = (30, 30, 30)
+        online_steps = (15, 15, 15, 15)
+        selection_samples = 12
+        final_samples = 24
+        eval_every = 5
     else:
-        train_small, train_large, validation = 256, 512, 96
-        phase_steps = (401, 401, 401)
+        train_small, train_large = 256, 512
+        offline_steps = (401, 401, 401)
+        online_steps = (240, 240, 240, 240)
+        selection_samples = 48
+        final_samples = 96
+        eval_every = 30
 
     observed_small, target_small = synthetic_albedo_benchmark_batch(
         train_small, size=48, seed=10
@@ -140,14 +256,10 @@ def main() -> None:
     observed_large, target_large = synthetic_albedo_benchmark_batch(
         train_large, size=48, seed=10
     )
-    observed_validation, target_validation = synthetic_albedo_benchmark_batch(
-        validation, size=48, seed=999
-    )
 
     reservoir = ToyImageReservoir(channels=16, steps=4, seed=1234)
     features_small = _capture_batch(reservoir, observed_small)
     features_large = _capture_batch(reservoir, observed_large)
-    features_validation = _capture_batch(reservoir, observed_validation)
 
     torch.manual_seed(42)
     model = AlbedoReadout(
@@ -160,7 +272,7 @@ def main() -> None:
         model,
         features_small,
         target_small,
-        steps=phase_steps[0],
+        steps=offline_steps[0],
         batch_size=8,
         learning_rate=1.5e-3,
         weight_decay=1e-4,
@@ -172,7 +284,7 @@ def main() -> None:
         model,
         features_large,
         target_large,
-        steps=phase_steps[1],
+        steps=offline_steps[1],
         batch_size=8,
         learning_rate=3e-4,
         weight_decay=5e-5,
@@ -184,36 +296,79 @@ def main() -> None:
         model,
         features_large,
         target_large,
-        steps=phase_steps[2],
+        steps=offline_steps[2],
         batch_size=8,
         learning_rate=1.2e-4,
         weight_decay=2e-5,
         eta_min=1e-5,
     )
 
-    prediction = _predict(model, features_validation)
-    metrics = albedo_metrics(prediction, target_validation)
+    validation_seeds = (999, 2027)
+    online_configs = (
+        (7e-5, 5e-6, 100000),
+        (3e-5, 2e-6, 200000),
+        (1.5e-5, 1e-6, 300000),
+        (8e-6, 5e-7, 400000),
+    )
+    online_history = []
+    for steps, (learning_rate, eta_min, seed_base) in zip(online_steps, online_configs):
+        online_history.append(
+            _online_generalization_phase(
+                model,
+                reservoir,
+                steps=steps,
+                batch_size=8,
+                learning_rate=learning_rate,
+                eta_min=eta_min,
+                seed_base=seed_base,
+                validation_seeds=validation_seeds,
+                validation_samples=selection_samples,
+                eval_every=eval_every,
+            )
+        )
+
+    evaluation_seeds = (999, 2027, 4040)
+    per_seed = {
+        str(seed): _evaluate_seed(model, reservoir, seed, final_samples)
+        for seed in evaluation_seeds
+    }
+    average_metrics = _mean_metrics(per_seed)
+
+    observed_sheet, target_sheet = synthetic_albedo_benchmark_batch(
+        final_samples, size=48, seed=4040
+    )
+    features_sheet = _capture_batch(reservoir, observed_sheet)
+    prediction_sheet = _predict(model, features_sheet)
+
     payload = model.checkpoint()
     payload.update(
         {
-            "metrics": metrics,
+            "metrics": {
+                "per_seed": per_seed,
+                "three_seed_average": average_metrics,
+            },
             "benchmark": {
                 "train_samples_phase1": train_small,
                 "train_samples_phase2_3": train_large,
-                "validation_samples": validation,
+                "selection_samples_per_seed": selection_samples,
+                "final_samples_per_seed": final_samples,
                 "image_size": 48,
-                "phase_steps": list(phase_steps),
+                "offline_steps": list(offline_steps),
+                "online_steps": list(online_steps),
                 "frozen_reservoir": True,
                 "trainable_parameters": sum(parameter.numel() for parameter in model.parameters()),
             },
+            "online_history": online_history,
         }
     )
-    torch.save(payload, output_dir / "albedo_readout_v2.pt")
+    checkpoint_path = output_dir / "albedo_readout_v2_generalized.pt"
+    comparison_path = output_dir / "comparison_seed4040.png"
+    torch.save(payload, checkpoint_path)
     _write_sheet(
-        output_dir / "comparison.png",
-        observed_validation,
-        target_validation,
-        prediction,
+        comparison_path,
+        observed_sheet,
+        target_sheet,
+        prediction_sheet,
     )
 
     report = {
@@ -221,11 +376,12 @@ def main() -> None:
         "readout_channels": int(features_large.shape[1]),
         "trajectory_channels": 64,
         "auxiliary_channels": 63,
-        "phase_losses": [phase1_loss, phase2_loss, phase3_loss],
-        "metrics": metrics,
+        "offline_phase_losses": [phase1_loss, phase2_loss, phase3_loss],
+        "online_history": online_history,
+        "metrics": payload["metrics"],
         "seconds": time.time() - started,
-        "checkpoint": str(output_dir / "albedo_readout_v2.pt"),
-        "comparison": str(output_dir / "comparison.png"),
+        "checkpoint": str(checkpoint_path),
+        "comparison": str(comparison_path),
     }
     (output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
