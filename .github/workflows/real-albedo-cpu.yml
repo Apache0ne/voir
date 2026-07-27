@@ -1,0 +1,59 @@
+name: real-albedo-cpu
+
+on:
+  pull_request:
+    paths:
+      - "voir/**"
+      - "scripts/download_hf_real30.py"
+      - "scripts/train_real_olbedo_cpu.py"
+      - "tests/**"
+      - ".github/workflows/real-albedo-cpu.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train-real30:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Download balanced real RGB/albedo pairs
+        run: |
+          python scripts/download_hf_real30.py \
+            --dataset GDAOSU/Olbedo \
+            --split train_selected \
+            --count 30 \
+            --train-count 24 \
+            --output datasets/hf_olbedo_real30
+      - name: Validate dataset
+        run: |
+          test "$(find datasets/hf_olbedo_real30/images -name '*.png' | wc -l)" -eq 30
+          test "$(find datasets/hf_olbedo_real30/albedo -name '*.png' | wc -l)" -eq 30
+          test "$(find datasets/hf_olbedo_real30/masks -name '*.png' | wc -l)" -eq 30
+          test "$(wc -l < datasets/hf_olbedo_real30/train_pairs.jsonl)" -eq 24
+          test "$(wc -l < datasets/hf_olbedo_real30/validation_pairs.jsonl)" -eq 6
+      - name: Unit tests
+        run: pytest
+      - name: Train and select real-photo readout on CPU
+        run: python scripts/train_real_olbedo_cpu.py --quick --threads 4
+      - name: Show report
+        run: cat outputs/real_olbedo_cpu_v3/report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voir-real-olbedo-cpu-v3
+          path: |
+            outputs/real_olbedo_cpu_v3
+            datasets/hf_olbedo_real30/metadata.json
+            datasets/hf_olbedo_real30/train_pairs.jsonl
+            datasets/hf_olbedo_real30/validation_pairs.jsonl
+          if-no-files-found: error
