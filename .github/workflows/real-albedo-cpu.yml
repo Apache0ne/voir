@@ -6,6 +6,7 @@ on:
       - "voir/**"
       - "scripts/download_hf_real30.py"
       - "scripts/train_real_olbedo_cpu.py"
+      - "scripts/train_real_olbedo_cpu_focused.py"
       - "tests/**"
       - ".github/workflows/real-albedo-cpu.yml"
   workflow_dispatch:
@@ -16,7 +17,7 @@ permissions:
 jobs:
   train-real30:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,15 +45,15 @@ jobs:
           test "$(wc -l < datasets/hf_olbedo_real30/validation_pairs.jsonl)" -eq 6
       - name: Unit tests
         run: pytest
-      - name: Full real-photo architecture search and refinement on CPU
-        run: python scripts/train_real_olbedo_cpu.py --threads 4
+      - name: Focused three-phase real-photo refinement on CPU
+        run: python scripts/train_real_olbedo_cpu_focused.py
       - name: Show report
-        run: cat outputs/real_olbedo_cpu_v3/report.json
+        run: cat outputs/real_olbedo_cpu_v3_focused/report.json
       - uses: actions/upload-artifact@v4
         with:
-          name: voir-real-olbedo-cpu-v3-full
+          name: voir-real-olbedo-cpu-v3-focused
           path: |
-            outputs/real_olbedo_cpu_v3
+            outputs/real_olbedo_cpu_v3_focused
             datasets/hf_olbedo_real30/metadata.json
             datasets/hf_olbedo_real30/train_pairs.jsonl
             datasets/hf_olbedo_real30/validation_pairs.jsonl
