@@ -33,7 +33,7 @@ Detached Mage states [evaluation, layer, channel, H, W]
 Diffuse RGB albedo
 ```
 
-For four scheduled steps, DPM++ SDE performs **seven Mage transformer evaluations**. VOIR preserves all seven. Source RGB is also transformed into a fixed, non-trainable 63-channel bank containing chromaticity, nonlinear color transforms, multiscale illumination estimates, Retinex-style ratios, and gradients. Only the final readout is optimized.
+For four scheduled steps, DPM++ SDE performs **seven Mage transformer evaluations**. VOIR preserves all seven. Source RGB is transformed into a fixed, non-trainable 63-channel bank containing chromaticity, nonlinear color transforms, multiscale illumination estimates, Retinex-style ratios, and gradients. Only the final readout is optimized.
 
 ## Exact sampling defaults
 
@@ -86,24 +86,43 @@ An initial sigma of exactly `1` is offset with `percent_to_sigma(1e-4)` before l
 
 When `torchsde` is installed, VOIR uses its Brownian tree. The built-in path-consistent Brownian bridge is the dependency-free fallback; it is mathematically equivalent but not bitwise identical to the `torchsde` stream.
 
-## CPU benchmark result
+## Best measured CPU result
 
-The current v2 readout was trained here on a disjoint synthetic intrinsic-image benchmark:
+The readout was trained in three cached-data phases followed by four low-rate online phases. Each online batch was newly generated, and checkpoints were selected using two disjoint validation seeds. Final evaluation used three seeds with 96 images each, including untouched seed `4040`.
 
 ```text
-training samples:       512
-held-out samples:        96
-resolution:           48x48
+training pool:          512 cached + 7,680 online samples
+held-out evaluation:    288 images across 3 seeds
+resolution:             48x48
 fixed input channels:   127
-trainable parameters: 80,163
-MAE:                 0.03016
-MSE:                 0.002529
-PSNR:                25.970 dB
-SSIM, local 7x7:      0.92151
-SSIM, global:         0.93321
+trainable parameters:   80,163
+
+three-seed average
+MAE:                    0.028975
+MSE:                    0.002378
+PSNR:                   26.243 dB
+SSIM, local 7x7:         0.925872
+SSIM, global:            0.935953
+
+untouched seed 4040
+MAE:                    0.029538
+MSE:                    0.002510
+PSNR:                   26.003 dB
+SSIM, local 7x7:         0.925669
+SSIM, global:            0.932271
 ```
 
-These are **held-out synthetic CPU-surrogate results**, not Mage-checkpoint or real-photo results. The benchmark includes sharp material boundaries, spatially varying light, color casts, specular highlights, exposure, and gamma changes.
+Relative to the previous v2 checkpoint, the three-seed average improved by:
+
+```text
+MAE:          -3.19%
+MSE:          -5.47%
+PSNR:         +0.245 dB
+local SSIM:   +0.00283
+global SSIM:  +0.00360
+```
+
+These are **held-out synthetic CPU-surrogate results**, not full-Mage or real-photo results. The benchmark contains sharp material boundaries, spatially varying illumination, colored light, specular highlights, exposure changes, and gamma changes. Exact values are recorded in `benchmarks/cpu_albedo_v2_generalized.json`.
 
 Run the reproducible full benchmark:
 
@@ -158,7 +177,7 @@ Training manifest:
 {"state":"states/a.pt","albedo":"targets/a.png"}
 ```
 
-Validation manifest uses the same format. Training selects the best validation MAE checkpoint:
+Validation manifest uses the same format. Training selects the best validation-MAE checkpoint:
 
 ```bash
 voir train-albedo train.jsonl checkpoints/albedo_v2.pt \
