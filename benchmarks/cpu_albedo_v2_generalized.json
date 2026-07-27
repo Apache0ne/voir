@@ -1,0 +1,66 @@
+{
+  "benchmark": "held-out synthetic intrinsic-albedo CPU surrogate",
+  "model": {
+    "architecture": "dilated_v2",
+    "trainable_parameters": 80163,
+    "readout_channels": 127,
+    "auxiliary_fixed_channels": 63,
+    "frozen_recurrent_channels": 64,
+    "reservoir_frozen": true,
+    "trained_component": "readout only"
+  },
+  "evaluation": {
+    "samples_per_seed": 96,
+    "image_size": 48,
+    "seeds": [999, 2027, 4040],
+    "generalized_v4": {
+      "999": {
+        "mae": 0.02933831885457039,
+        "mse": 0.0024091193918138742,
+        "psnr": 26.181416765806933,
+        "ssim_7x7": 0.9240961670875549,
+        "global_ssim": 0.9359701871871948
+      },
+      "2027": {
+        "mae": 0.028048738837242126,
+        "mse": 0.0022153218742460012,
+        "psnr": 26.545631642250296,
+        "ssim_7x7": 0.9278502464294434,
+        "global_ssim": 0.9396186470985413
+      },
+      "4040": {
+        "mae": 0.02953757531940937,
+        "mse": 0.002510268008336425,
+        "psnr": 26.002799086671807,
+        "ssim_7x7": 0.9256690740585327,
+        "global_ssim": 0.9322707056999207
+      },
+      "three_seed_average": {
+        "mae": 0.028974877670407295,
+        "mse": 0.0023782364247987666,
+        "psnr": 26.24328249824301,
+        "ssim_7x7": 0.9258718291918436,
+        "global_ssim": 0.9359531799952189
+      }
+    },
+    "previous_v2_average": {
+      "mae": 0.029929041862487793,
+      "mse": 0.0025157774798572063,
+      "psnr": 25.998428252594067,
+      "ssim_7x7": 0.9230445226033529,
+      "global_ssim": 0.9323540329933167
+    },
+    "improvement": {
+      "mae_reduction_percent": 3.188087999824745,
+      "mse_reduction_percent": 5.467139131329152,
+      "psnr_gain_db": 0.24485424564894132,
+      "ssim_7x7_gain": 0.00282730658849073,
+      "global_ssim_gain": 0.0035991470019022254
+    }
+  },
+  "limitations": [
+    "Synthetic CPU-surrogate benchmark, not a real-photo benchmark.",
+    "The full 4B Mage checkpoint was not run on CPU.",
+    "The CPU reservoir validates readout design and training behavior; CUDA Mage states are the deployment input."
+  ]
+}
